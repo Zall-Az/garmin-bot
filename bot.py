@@ -13,17 +13,19 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-from groq import Groq, RateLimitError, APIError
+from openai import OpenAI, RateLimitError, APIError
 
 # ============================================================
 # KONFIGURASI
 # ============================================================
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY")
-MCP_URL          = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
-CHAT_ID          = os.environ.get("CHAT_ID")
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY")
+MCP_URL             = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
+CHAT_ID             = os.environ.get("CHAT_ID")
 
-MODEL_CHAT       = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Model OpenRouter — ganti sesuai kebutuhan, contoh lain:
+# "openai/gpt-4o-mini", "anthropic/claude-3-haiku", "google/gemini-flash-1.5"
+MODEL_CHAT       = "anthropic/claude-opus-4-7"
 TEMPERATURE_CHAT = 0.1          # sangat rendah → lebih faktual, minim halusinasi
 
 CHECK_INTERVAL   = 600
@@ -34,7 +36,14 @@ GARMIN_CACHE_TTL = 300
 WITA = timezone(timedelta(hours=8))
 # ============================================================
 
-groq_client          = Groq(api_key=GROQ_API_KEY)
+openrouter_client = OpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+    default_headers={
+        "HTTP-Referer": "https://github.com/running-assistant-bot",
+        "X-Title": "Running Assistant Bot",
+    }
+)
 reported_activities  = set()
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
 
@@ -591,10 +600,10 @@ def build_user_content(user_message: str, garmin_data: str, mode: str = "data") 
 
 
 # ════════════════════════════════════════════════════════════
-#  STREAMING GROQ
+#  STREAMING OPENROUTER
 # ════════════════════════════════════════════════════════════
 
-async def stream_groq_to_telegram(
+async def stream_to_telegram(
     user_id: int,
     user_message: str,
     user_content: str,
@@ -630,7 +639,7 @@ async def stream_groq_to_telegram(
             return ""
 
         except APIError as e:
-            print(f"Groq API error: {e}")
+            print(f"OpenRouter API error: {e}")
             try:
                 await message.edit_text("❌ Error dari server AI. Coba lagi ya!")
             except Exception:
@@ -651,7 +660,7 @@ async def _do_stream(user_id, user_message, messages, message, context):
     loop = asyncio.get_event_loop()
 
     def get_stream():
-        return groq_client.chat.completions.create(
+        return openrouter_client.chat.completions.create(
             model=MODEL_CHAT,
             messages=messages,
             max_tokens=1024,
@@ -758,7 +767,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 hasil, mode="data"
             )
             try:
-                resp = groq_client.chat.completions.create(
+                resp = openrouter_client.chat.completions.create(
                     model=MODEL_CHAT,
                     messages=[
                         {"role": "system", "content": COACH_SYSTEM_PROMPT},
@@ -847,7 +856,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Classifier:</b> <code>regex (built-in)</code>\n"
         f"• <b>Temperature:</b> <code>{TEMPERATURE_CHAT}</code>\n"
         f"• <b>Timezone:</b> <code>WITA (UTC+8)</code>\n\n"
-        f"<i>Powered by Groq</i>"
+        f"<i>Powered by OpenRouter</i>"
     )
     await update.message.reply_text(info, parse_mode=ParseMode.HTML)
 
@@ -873,7 +882,7 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "HANYA gunakan angka yang ada di data.",
         data, mode="data"
     )
-    await stream_groq_to_telegram(uid, user_content, user_content, pesan, context)
+    await stream_to_telegram(uid, user_content, user_content, pesan, context)
 
 
 async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,7 +920,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Sapaan murni ─────────────────────────────────────────
     if intent == "sapaan":
         user_content = build_user_content(pertanyaan, "", mode="no_data")
-        await stream_groq_to_telegram(uid, pertanyaan, user_content, pesan, context)
+        await stream_to_telegram(uid, pertanyaan, user_content, pesan, context)
         return
 
     # ── Follow-up (pakai cache) ───────────────────────────────
@@ -924,7 +933,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         user_content = build_user_content(pertanyaan, garmin_data, mode="data")
-        await stream_groq_to_telegram(uid, pertanyaan, user_content, pesan, context)
+        await stream_to_telegram(uid, pertanyaan, user_content, pesan, context)
         return
 
     # ── Tanya spesifik / analisis / saran → fetch data ───────
@@ -939,7 +948,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_content = build_user_content(pertanyaan, data, mode="data")
-    await stream_groq_to_telegram(uid, pertanyaan, user_content, pesan, context)
+    await stream_to_telegram(uid, pertanyaan, user_content, pesan, context)
 
 
 # ════════════════════════════════════════════════════════════
