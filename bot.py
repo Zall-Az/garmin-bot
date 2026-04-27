@@ -288,7 +288,7 @@ async def _do_stream(user_id, user_message, messages, message, context):
 
     def get_stream():
         return groq_client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="llama-3.3-70b-versatile",
             messages=messages,
             max_tokens=1024,
             temperature=0.7,
@@ -393,7 +393,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 response = groq_client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    model="llama-3.3-70b-versatile",
                     messages=[
                         {"role": "system", "content": COACH_SYSTEM_PROMPT},
                         {
