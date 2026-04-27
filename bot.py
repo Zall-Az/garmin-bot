@@ -24,8 +24,11 @@ MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-
 CHAT_ID        = os.environ.get("CHAT_ID")
 
 # ⭐ MODEL CONFIG (gampang ganti di sini)
-MODEL_CHAT       = "meta-llama/llama-4-scout-17b-16e-instruct"        # Model utama untuk jawab user
+MODEL_CHAT       = "llama-3.3-70b-versatile"    # Model utama untuk jawab user (stabil, anti-halu)
 MODEL_CLASSIFIER = "llama-3.1-8b-instant"       # Model kecil untuk classify intent
+
+# Temperature (rendah = lebih akurat, tidak mengarang)
+TEMPERATURE_CHAT = 0.3
 
 # Tuning parameters
 CHECK_INTERVAL   = 600   # auto-cek aktivitas tiap 10 menit
@@ -188,7 +191,14 @@ ATURAN:
 6. KONTEKS:
    - Inget percakapan sebelumnya
    - Kalau user nanya "kenapa?" atau "terus?", lanjutkan dari topik tadi
-   - Jangan ulang info yang udah dikasih sebelumnya"""
+   - Jangan ulang info yang udah dikasih sebelumnya
+
+7. ANTI-HALUSINASI (WAJIB!):
+   - JANGAN PERNAH mengarang angka atau data yang tidak ada di data Garmin
+   - Kalau data Garmin tidak tersedia atau tidak relevan, bilang jujur:
+     "Data tidak tersedia, coba tanya yang lebih spesifik ya!"
+   - HANYA gunakan angka yang benar-benar ada di data yang diberikan
+   - Kalau tidak yakin, tanya balik ke user daripada mengarang"""
 
 
 # ── Klasifikasi intent ────────────────────────────────────────
@@ -363,7 +373,7 @@ async def _do_stream(user_id, user_message, messages, message, context):
             model=MODEL_CHAT,
             messages=messages,
             max_tokens=1024,
-            temperature=0.7,
+            temperature=TEMPERATURE_CHAT,
             stream=True
         )
 
@@ -481,7 +491,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                         }
                     ],
                     max_tokens=400,
-                    temperature=0.7
+                    temperature=TEMPERATURE_CHAT
                 )
                 ringkasan = response.choices[0].message.content
                 html_text = f"🏃 <b>Aktivitas Lari Baru!</b>\n\n{markdown_to_html(ringkasan)}"
