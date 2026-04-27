@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from collections import defaultdict, deque
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, Conflict
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
@@ -22,17 +22,23 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY")
 MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID        = os.environ.get("CHAT_ID")
-CHECK_INTERVAL = 600  # naikin ke 10 menit, lebih hemat
-STREAM_INTERVAL = 1.5
-MAX_HISTORY = 8
-GARMIN_CACHE_TTL = 300  # cache data Garmin 5 menit
+
+# ⭐ MODEL CONFIG (gampang ganti di sini)
+MODEL_CHAT       = "openai/gpt-oss-120b"        # Model utama untuk jawab user
+MODEL_CLASSIFIER = "llama-3.1-8b-instant"       # Model kecil untuk classify intent
+
+# Tuning parameters
+CHECK_INTERVAL   = 600   # auto-cek aktivitas tiap 10 menit
+STREAM_INTERVAL  = 1.5   # interval edit pesan saat streaming
+MAX_HISTORY      = 8     # max pesan history per user
+GARMIN_CACHE_TTL = 300   # cache data Garmin 5 menit
 # ============================================================
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 reported_activities = set()
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 
-# Cache data Garmin per user (biar nggak fetch ulang terus)
+# Cache data Garmin per user
 garmin_cache = {}  # {user_id: (timestamp, data)}
 
 
@@ -79,6 +85,7 @@ KARAKTER:
 - Ramah seperti teman, bukan robot formal
 - Bahasa Indonesia santai tapi profesional
 - Inget konteks percakapan sebelumnya
+- Motivatif dan supportive
 
 ATURAN:
 
@@ -89,7 +96,7 @@ ATURAN:
 
 2. PERTANYAAN SPESIFIK:
    - Jawab LANGSUNG dan SINGKAT, fokus ke yang ditanya saja
-   - JANGAN kasih full report
+   - JANGAN kasih full report kalau cuma ditanya 1 hal
    - Contoh: "HR rata-rata kamu 30 hari terakhir adalah **136 bpm**. Tergolong intensitas sedang ya 👍"
 
 3. ANALISIS LENGKAP (kalau diminta):
@@ -99,21 +106,23 @@ ATURAN:
      ❤️ **Performa Tubuh**
      💡 **Insight & Saran**
 
-4. ATURAN ANGKA:
+4. ATURAN ANGKA (PENTING!):
    - Jarak: HANYA km (1-2 desimal). Contoh: "12,5 km"
    - Durasi: jam:menit. Contoh: "23 jam 30 menit"
    - Pace: menit:detik per km. Contoh: "5:30/km"
    - HR: tambah "bpm". Contoh: "136 bpm"
+   - Kalori: tambah "kcal". Contoh: "8.431 kcal"
    - JANGAN tampilkan satuan raw (meter, detik)
 
 5. FORMATTING:
    - Bold pakai **double asterisk** untuk angka penting
    - Bullet pakai • (BUKAN * atau -)
+   - Pisahkan section dengan baris kosong
 
 6. KONTEKS:
    - Inget percakapan sebelumnya
-   - Kalau user nanya "kenapa?", lanjut dari topik tadi
-   - Jangan ulang info yang udah dikasih"""
+   - Kalau user nanya "kenapa?" atau "terus?", lanjutkan dari topik tadi
+   - Jangan ulang info yang udah dikasih sebelumnya"""
 
 
 # ── Klasifikasi intent ────────────────────────────────────────
@@ -123,7 +132,7 @@ async def classify_intent(message: str) -> str:
 
         def _classify():
             return groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=MODEL_CLASSIFIER,
                 messages=[
                     {"role": "system", "content": INTENT_CLASSIFIER_PROMPT},
                     {"role": "user", "content": message}
@@ -198,7 +207,6 @@ async def fetch_garmin_data(user_id: int = 0) -> str:
 
     data = f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
 
-    # Simpan ke cache
     garmin_cache[user_id] = (now, data)
     print(f"✓ Fetch Garmin baru, cached")
 
@@ -226,23 +234,19 @@ async def stream_groq_to_telegram(
         user_content = user_message
     messages.append({"role": "user", "content": user_content})
 
-    # Try dengan retry kalau rate limit
     for attempt in range(max_retries + 1):
         try:
             return await _do_stream(user_id, user_message, messages, message, context)
         except RateLimitError as e:
             if attempt < max_retries:
-                # Tunggu sesuai instruksi Groq, atau default 30 detik
                 wait_time = 30
                 error_msg = str(e)
-                # Coba ekstrak waktu tunggu dari error
                 match = re.search(r'try again in ([\d.]+)s', error_msg)
                 if match:
                     wait_time = float(match.group(1)) + 1
 
                 print(f"⚠ Rate limit, tunggu {wait_time}s...")
 
-                # Update message biar user tau
                 try:
                     await message.edit_text(
                         f"⏳ Server sibuk, tunggu sebentar ({int(wait_time)}s)..."
@@ -253,7 +257,6 @@ async def stream_groq_to_telegram(
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                # Final retry gagal juga
                 try:
                     await message.edit_text(
                         "😅 Maaf, server lagi sibuk banget. Coba lagi 1-2 menit ya!"
@@ -288,7 +291,7 @@ async def _do_stream(user_id, user_message, messages, message, context):
 
     def get_stream():
         return groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODEL_CHAT,
             messages=messages,
             max_tokens=1024,
             temperature=0.7,
@@ -393,7 +396,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 response = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=MODEL_CHAT,
                     messages=[
                         {"role": "system", "content": COACH_SYSTEM_PROMPT},
                         {
@@ -415,7 +418,6 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=CHAT_ID, text=html_text, parse_mode=ParseMode.HTML
                 )
             except RateLimitError:
-                # Skip auto-notif kalau rate limit, tunggu siklus berikutnya
                 print("⚠ Rate limit di auto-notif, skip...")
             except BadRequest:
                 clean = re.sub(r'\*+', '', ringkasan)
@@ -431,14 +433,13 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tangani semua error yang lolos."""
     error = context.error
-    print(f"⚠ Global error: {error}")
 
-    # Skip Conflict error (instance ganda) - biar log nggak penuh
-    from telegram.error import Conflict
+    # Skip Conflict error (instance ganda) biar log nggak penuh
     if isinstance(error, Conflict):
         return
 
-    # Coba kirim pesan error ke user kalau ada update
+    print(f"⚠ Global error: {error}")
+
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -462,11 +463,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Contoh pertanyaan:</b>\n"
         f"• Berapa pace rata-rata saya?\n"
         f"• Lari terjauh saya kapan?\n"
-        f"• Kasih analisis lengkap dong\n\n"
+        f"• Kasih analisis lengkap dong\n"
+        f"• Saran latihan untuk improve\n\n"
         f"<b>Command:</b>\n"
         f"/ringkasan — analisis 30 hari\n"
         f"/cekkoneksi — tes Garmin\n"
-        f"/reset — reset percakapan"
+        f"/reset — reset percakapan\n"
+        f"/model — info model AI"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
@@ -474,10 +477,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id].clear()
-    # Clear cache juga
     if user_id in garmin_cache:
         del garmin_cache[user_id]
     await update.message.reply_text("✅ Percakapan di-reset. Mulai fresh dari sini ya!")
+
+
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Info model yang dipakai bot."""
+    info = (
+        f"🤖 <b>Model AI Info</b>\n\n"
+        f"• <b>Chat utama:</b> <code>{MODEL_CHAT}</code>\n"
+        f"• <b>Classifier:</b> <code>{MODEL_CLASSIFIER}</code>\n\n"
+        f"<i>Powered by Groq</i>"
+    )
+    await update.message.reply_text(info, parse_mode=ParseMode.HTML)
 
 
 async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,7 +505,7 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await stream_groq_to_telegram(
         user_id,
-        "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi.",
+        "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi (statistik utama, detail aktivitas, performa tubuh, dan insight).",
         data,
         pesan,
         context
@@ -548,16 +561,19 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────
 def main():
-    print("🤖 Running Assistant Bot berjalan (conversational + cached)...")
+    print("🤖 Running Assistant Bot berjalan...")
+    print(f"   Chat model:       {MODEL_CHAT}")
+    print(f"   Classifier model: {MODEL_CLASSIFIER}")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("ringkasan",   cmd_ringkasan))
     app.add_handler(CommandHandler("cekkoneksi",  cmd_cekkoneksi))
     app.add_handler(CommandHandler("reset",       cmd_reset))
+    app.add_handler(CommandHandler("model",       cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
 
-    # Error handler global
     app.add_error_handler(error_handler)
 
     if CHAT_ID:
