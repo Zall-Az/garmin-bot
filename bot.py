@@ -4,6 +4,7 @@ import re
 import json
 import asyncio
 from datetime import date, timedelta
+from collections import defaultdict, deque
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter
@@ -22,111 +23,131 @@ MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-
 CHAT_ID        = os.environ.get("CHAT_ID")
 CHECK_INTERVAL = 300
 STREAM_INTERVAL = 1.5
+MAX_HISTORY = 10  # max history per user
 # ============================================================
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 reported_activities = set()
 
+# Conversation history per user (in-memory)
+# Format: {user_id: deque([{role, content}, ...])}
+conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
 
 # ── Convert markdown ke HTML Telegram ─────────────────────────
 def markdown_to_html(text: str) -> str:
-    """Convert markdown standar ke HTML Telegram."""
-    # Escape HTML special chars
     text = text.replace("&", "&amp;")
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
-
-    # Convert "* item" / "- item" di awal baris → "• item"
     text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)
-
-    # **bold** → <b>bold</b>
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
     text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
-
-    # `code` → <code>code</code>
     text = re.sub(r'`([^`\n]+?)`', r'<code>\1</code>', text)
-
-    # Hapus single asterisk yang nyangkut
     text = re.sub(r'(?<!\w)\*(?!\w)', '', text)
-
     return text
 
 
 def safe_html_for_streaming(text: str) -> str:
-    """Untuk streaming - tutup tag HTML yang masih kebuka."""
     html = markdown_to_html(text)
-
     open_b = html.count("<b>") - html.count("</b>")
     open_code = html.count("<code>") - html.count("</code>")
-
     if open_code > 0:
         html += "</code>" * open_code
     if open_b > 0:
         html += "</b>" * open_b
-
     return html
 
 
-# ── System prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = """Kamu adalah pelatih lari pribadi yang ramah dan cerdas.
-Jawab berdasarkan data Garmin yang diberikan dalam Bahasa Indonesia.
+# ── System prompts ────────────────────────────────────────────
+INTENT_CLASSIFIER_PROMPT = """Kamu adalah classifier untuk pesan pengguna ke bot pelatih lari.
+Klasifikasikan pesan user ke salah satu kategori berikut:
 
-═══ ATURAN FORMAT WAJIB ═══
+- "sapaan": Pesan kasual seperti "halo", "hi", "pagi", "apa kabar", "gimana", terima kasih, dll. TANPA pertanyaan tentang data lari.
+- "tanya_spesifik": Pertanyaan tentang ASPEK TERTENTU dari data lari (misal: "berapa pace saya?", "denyut nadi rata-rata?", "lari terjauh kapan?", "minggu ini lari berapa kali?")
+- "analisis_lengkap": Permintaan analisis menyeluruh (misal: "analisis dong", "kasih ringkasan", "evaluasi performa saya", "gimana progress saya bulan ini?")
+- "saran_latihan": Minta saran/rekomendasi (misal: "latihan apa yang cocok?", "saran dong", "gimana cara improve?")
+- "follow_up": Pertanyaan lanjutan dari percakapan sebelumnya (misal: "kenapa begitu?", "terus gimana?", "kasih detail dong")
+- "lain": Pertanyaan di luar konteks lari/Garmin
 
-1. STRUKTUR JAWABAN:
-   - Mulai dengan sapaan singkat 1 kalimat
-   - Bagi dalam SECTION dengan judul emoji (lihat contoh di bawah)
-   - Tutup dengan motivasi/saran 1-2 kalimat
+Jawab HANYA dengan satu kata kategori, tanpa penjelasan apapun."""
 
-2. JUDUL SECTION (pakai emoji + bold):
-   📊 **Statistik Utama**
-   🏃 **Detail Aktivitas**
-   ❤️ **Performa Tubuh**
-   💡 **Insight & Saran**
 
-3. FORMATTING TEXT:
-   - Bold pakai **double asterisk** untuk angka penting dan nama aktivitas
-   - Bullet list pakai • (bullet character), JANGAN pakai * atau -
-   - Pisahkan section dengan baris kosong
+COACH_SYSTEM_PROMPT = """Kamu adalah pelatih lari pribadi yang ramah, cerdas, dan conversational. Namamu Running Assistant.
 
-4. ATURAN ANGKA (PENTING!):
-   - Jarak: HANYA km dengan 1-2 desimal. Contoh: "12,5 km"
-     ❌ JANGAN: "12500 meter" atau "12500 m" atau "12,5 km (12500 meter)"
-   - Durasi: format jam dan menit. Contoh: "23 jam 30 menit"
-     ❌ JANGAN: "84769 detik" atau "84769 s"
-   - Pace: format menit:detik per km. Contoh: "5:30/km"
-   - Heart rate: bulatkan, tambah 'bpm'. Contoh: "136 bpm"
-   - Kalori: tambah "kcal". Contoh: "8.431 kcal"
-   - JANGAN PERNAH tampilkan satuan raw (meter, detik) di output
+KARAKTER:
+- Ramah seperti teman, bukan robot formal
+- Bahasa Indonesia santai tapi profesional
+- Motivatif dan supportive
+- Inget konteks percakapan sebelumnya
 
-5. CONTOH JAWABAN YANG BENAR:
+ATURAN PENTING:
 
-Halo! Berikut analisis performa lari kamu 30 hari terakhir.
+1. SAPAAN/CASUAL CHAT:
+   - Balas natural dan singkat (1-3 kalimat)
+   - JANGAN langsung kasih data atau analisis
+   - Tanya apa yang bisa dibantu
+   - Contoh: "Halo! Apa kabar? Ada yang mau dianalisis dari aktivitas lari kamu?"
 
-📊 **Statistik Utama**
-- Total aktivitas: **24 sesi**
-- Total jarak: **124,3 km**
-- Total durasi: **23 jam 30 menit**
-- Kalori terbakar: **8.431 kcal**
+2. PERTANYAAN SPESIFIK (denyut nadi, pace, jarak, dll):
+   - Jawab LANGSUNG dan SINGKAT, fokus ke yang ditanya saja
+   - JANGAN kasih full report kalau cuma ditanya 1 hal
+   - Contoh: "HR rata-rata kamu 30 hari terakhir adalah 136 bpm. Tergolong intensitas sedang ya 👍"
 
-🏃 **Detail Aktivitas**
-- Lari: **16 sesi** (103,4 km)
-- Strength training: **5 sesi**
-- Padel: **1 sesi**
-- Jalan kaki: **2 sesi**
+3. ANALISIS LENGKAP (kalau diminta):
+   - Pakai struktur lengkap dengan section + emoji
+   - Format:
+     📊 **Statistik Utama**
+     🏃 **Detail Aktivitas**
+     ❤️ **Performa Tubuh**
+     💡 **Insight & Saran**
 
-❤️ **Performa Tubuh**
-- HR rata-rata: **136 bpm**
-- HR maksimum: **174 bpm**
+4. ATURAN ANGKA:
+   - Jarak: HANYA km (1-2 desimal). Contoh: "12,5 km"
+   - Durasi: jam dan menit. Contoh: "23 jam 30 menit"
+   - Pace: menit:detik per km. Contoh: "5:30/km"
+   - Heart rate: tambah "bpm". Contoh: "136 bpm"
+   - JANGAN tampilkan satuan raw (meter, detik)
 
-💡 **Insight**
-Konsistensi kamu keren banget! Coba tingkatkan jarak per sesi minggu depan untuk progress yang lebih baik.
+5. FORMATTING:
+   - Bold pakai **double asterisk** untuk angka penting
+   - Bullet pakai • (BUKAN * atau -)
 
-═══ JAWABAN YANG SALAH (JANGAN!) ═══
-❌ "124252,71 meter (sekitar 124,25 km)"  → harus "124,3 km" saja
-❌ "* item list"  → harus "• item list"
-❌ "84769 detik (sekitar 23,5 jam)"  → harus "23 jam 30 menit" saja
+6. KONTEKS:
+   - Inget percakapan sebelumnya
+   - Kalau user nanya "kenapa?" atau "terus?", lanjutkan dari topik tadi
+   - Jangan ulang info yang udah dikasih sebelumnya
 """
+
+
+# ── Klasifikasi intent (ringan, cepat) ────────────────────────
+async def classify_intent(message: str) -> str:
+    """Tentuin tipe pesan: sapaan / tanya_spesifik / analisis_lengkap / saran_latihan / follow_up / lain"""
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def _classify():
+            return groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",  # model kecil & cepat untuk classify
+                messages=[
+                    {"role": "system", "content": INTENT_CLASSIFIER_PROMPT},
+                    {"role": "user", "content": message}
+                ],
+                max_tokens=20,
+                temperature=0.1
+            )
+        
+        response = await loop.run_in_executor(None, _classify)
+        intent = response.choices[0].message.content.strip().lower()
+        
+        # Ekstrak kategori dari response
+        valid = ["sapaan", "tanya_spesifik", "analisis_lengkap", "saran_latihan", "follow_up", "lain"]
+        for v in valid:
+            if v in intent:
+                return v
+        return "tanya_spesifik"  # default
+    except Exception as e:
+        print(f"Intent classify error: {e}")
+        return "tanya_spesifik"
 
 
 # ── Panggil tool MCP ──────────────────────────────────────────
@@ -154,7 +175,7 @@ async def call_mcp(tool_name: str, arguments: dict = {}) -> str:
         return f"Error: {str(e)}"
 
 
-# ── Ambil data Garmin lengkap ─────────────────────────────────
+# ── Ambil data Garmin ─────────────────────────────────────────
 async def fetch_garmin_data() -> str:
     today = date.today().isoformat()
     bulan_lalu = (date.today() - timedelta(days=30)).isoformat()
@@ -172,25 +193,34 @@ async def fetch_garmin_data() -> str:
     return f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
 
 
-# ── Streaming Groq ke Telegram ───────────────────────────────
+# ── Streaming Groq ke Telegram (dengan history) ──────────────
 async def stream_groq_to_telegram(
-    pertanyaan: str,
-    data_garmin: str,
+    user_id: int,
+    user_message: str,
+    extra_context: str,
     message,
     context: ContextTypes.DEFAULT_TYPE
 ) -> str:
-    """Stream response Groq ke Telegram dengan HTML rendering."""
+    """Stream response dengan conversation history."""
+    
+    # Bangun messages dari history + context
+    messages = [{"role": "system", "content": COACH_SYSTEM_PROMPT}]
+    
+    # Inject history sebelumnya
+    history = list(conversation_history[user_id])
+    messages.extend(history)
+    
+    # Tambah pesan user saat ini (dengan extra context kalau ada)
+    if extra_context:
+        user_content = f"{user_message}\n\n[Data Garmin tersedia:]\n{extra_context}"
+    else:
+        user_content = user_message
+    messages.append({"role": "user", "content": user_content})
 
     def get_stream():
         return groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Data Garmin saya:\n{data_garmin}\n\nPertanyaan: {pertanyaan}"
-                }
-            ],
+            messages=messages,
             max_tokens=1024,
             temperature=0.7,
             stream=True
@@ -226,13 +256,9 @@ async def stream_groq_to_telegram(
 
             if html_text != last_sent_html:
                 try:
-                    await message.edit_text(
-                        html_text,
-                        parse_mode=ParseMode.HTML
-                    )
+                    await message.edit_text(html_text, parse_mode=ParseMode.HTML)
                     last_sent_html = html_text
                     last_update_time = now
-
                     await context.bot.send_chat_action(
                         chat_id=message.chat_id,
                         action=ChatAction.TYPING
@@ -245,7 +271,7 @@ async def stream_groq_to_telegram(
                 except Exception as e:
                     print(f"Stream edit error: {e}")
 
-    # Final update tanpa cursor
+    # Final update
     if full_text:
         final_html = markdown_to_html(full_text)
         try:
@@ -260,6 +286,10 @@ async def stream_groq_to_telegram(
                     pass
         except Exception as e:
             print(f"Final edit error: {e}")
+    
+    # Simpan ke history
+    conversation_history[user_id].append({"role": "user", "content": user_message})
+    conversation_history[user_id].append({"role": "assistant", "content": full_text})
 
     return full_text
 
@@ -286,7 +316,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
         if not reported_activities:
             reported_activities.add(hasil[:200])
-            print("✓ Initial scan selesai, monitoring aktivitas baru...")
+            print("✓ Initial scan selesai...")
             return
 
         signature = hasil[:200]
@@ -296,17 +326,17 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": COACH_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
                             f"Data Garmin terbaru:\n{hasil}\n\n"
-                            "Ada aktivitas lari baru! Berikan ringkasan singkat dan motivasi. "
-                            "Sebutkan jarak (km), pace, dan durasi (jam:menit)."
+                            "Aktivitas lari baru baru aja kedeteksi! Kasih ringkasan singkat "
+                            "(jarak km, pace, durasi jam:menit) plus motivasi pendek."
                         )
                     }
                 ],
-                max_tokens=512,
+                max_tokens=400,
                 temperature=0.7
             )
             ringkasan = response.choices[0].message.content
@@ -314,15 +344,12 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=html_text,
-                    parse_mode=ParseMode.HTML
+                    chat_id=CHAT_ID, text=html_text, parse_mode=ParseMode.HTML
                 )
             except BadRequest:
                 clean = re.sub(r'\*+', '', ringkasan)
                 await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🏃 Aktivitas Lari Baru!\n\n{clean}"
+                    chat_id=CHAT_ID, text=f"🏃 Aktivitas Lari Baru!\n\n{clean}"
                 )
 
     except Exception as e:
@@ -333,35 +360,48 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nama = update.effective_user.first_name
     chat_id = update.effective_chat.id
+    
+    # Reset history
+    conversation_history[update.effective_user.id].clear()
+    
     welcome = (
         f"👟 Halo <b>{nama}</b>!\n\n"
-        f"Saya <b>Running Assistant</b>, pelatih lari pribadimu yang siap "
-        f"menganalisis data Garmin kamu kapan aja.\n\n"
+        f"Aku <b>Running Assistant</b>, pelatih lari pribadi kamu. "
+        f"Tanya apa aja seputar aktivitas Garmin kamu, aku siap bantu! 💪\n\n"
         f"📌 Chat ID: <code>{chat_id}</code>\n\n"
-        f"<b>Coba tanya apa aja:</b>\n"
-        f"• Berapa total lari saya bulan ini?\n"
-        f"• Gimana pace rata-rata saya?\n"
-        f"• Aktivitas terakhir saya apa?\n"
-        f"• Kasih saran latihan dong\n\n"
+        f"<b>Contoh pertanyaan:</b>\n"
+        f"• Berapa pace rata-rata saya?\n"
+        f"• Lari terjauh saya kapan?\n"
+        f"• Kasih analisis lengkap dong\n"
+        f"• Saran latihan untuk improve\n\n"
         f"<b>Command:</b>\n"
-        f"/ringkasan — analisis lengkap 30 hari\n"
-        f"/cekkoneksi — tes koneksi Garmin"
+        f"/ringkasan — analisis 30 hari\n"
+        f"/cekkoneksi — tes Garmin\n"
+        f"/reset — reset percakapan"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
 
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset conversation history user."""
+    user_id = update.effective_user.id
+    conversation_history[user_id].clear()
+    await update.message.reply_text("✅ Percakapan di-reset. Mulai fresh dari sini ya!")
+
+
 async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
     pesan = await update.message.reply_text("▌")
     data = await fetch_garmin_data()
 
     await stream_groq_to_telegram(
-        "Berikan ringkasan lengkap aktivitas lari 30 hari terakhir dengan format "
-        "section yang rapi (statistik utama, detail aktivitas, performa tubuh, dan insight).",
+        user_id,
+        "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi.",
         data,
         pesan,
         context
@@ -370,8 +410,7 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
     pesan = await update.message.reply_text("🔍 Mengecek koneksi...")
     hasil = await call_mcp("list_activities", {"limit": 1})
@@ -379,37 +418,80 @@ async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Error" in hasil:
         await pesan.edit_text(f"❌ Gagal terhubung:\n{hasil}")
     else:
-        await pesan.edit_text("✅ <b>Koneksi Garmin berhasil!</b>\nData siap dianalisis.", parse_mode=ParseMode.HTML)
+        await pesan.edit_text(
+            "✅ <b>Koneksi Garmin berhasil!</b>\nData siap dianalisis.",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     pertanyaan = update.message.text
 
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
+    # STEP 1: Klasifikasi intent dulu
+    intent = await classify_intent(pertanyaan)
+    print(f"Intent: {intent} | Pesan: {pertanyaan[:50]}")
+
+    # STEP 2: Tentuin perlu fetch data atau nggak
     pesan = await update.message.reply_text("▌")
-    data = await fetch_garmin_data()
-    await stream_groq_to_telegram(pertanyaan, data, pesan, context)
+    
+    if intent == "sapaan":
+        # Sapaan biasa - nggak perlu data Garmin
+        await stream_groq_to_telegram(
+            user_id,
+            pertanyaan,
+            "",  # nggak ada extra context
+            pesan,
+            context
+        )
+    elif intent == "lain":
+        # Pertanyaan di luar konteks - balas tanpa data
+        await stream_groq_to_telegram(
+            user_id,
+            pertanyaan + "\n\n[Note: User nanya hal di luar konteks lari. Jawab ramah dan arahkan balik ke topik lari.]",
+            "",
+            pesan,
+            context
+        )
+    elif intent == "follow_up":
+        # Follow-up - pakai history aja, biasanya cukup
+        await stream_groq_to_telegram(
+            user_id,
+            pertanyaan,
+            "",  # history udah ada di conversation_history
+            pesan,
+            context
+        )
+    else:
+        # tanya_spesifik / analisis_lengkap / saran_latihan - perlu data
+        data = await fetch_garmin_data()
+        await stream_groq_to_telegram(
+            user_id,
+            pertanyaan,
+            data,
+            pesan,
+            context
+        )
 
 
 # ── Main ──────────────────────────────────────────────────────
 def main():
-    print("🤖 Running Assistant Bot berjalan...")
+    print("🤖 Running Assistant Bot berjalan (conversational mode)...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("ringkasan",   cmd_ringkasan))
     app.add_handler(CommandHandler("cekkoneksi",  cmd_cekkoneksi))
+    app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
 
     if CHAT_ID:
         app.job_queue.run_repeating(
-            cek_aktivitas_baru,
-            interval=CHECK_INTERVAL,
-            first=10
+            cek_aktivitas_baru, interval=CHECK_INTERVAL, first=10
         )
         print(f"✓ Auto-monitoring aktif (cek tiap {CHECK_INTERVAL}s)")
     else:
