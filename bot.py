@@ -23,18 +23,18 @@ GROQ_API_KEY   = os.environ.get("GROQ_API_KEY")
 MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID        = os.environ.get("CHAT_ID")
 
-# ⭐ MODEL CONFIG (gampang ganti di sini)
-MODEL_CHAT       = "openai/gpt-oss-120b"    # Model utama untuk jawab user (stabil, anti-halu)
-MODEL_CLASSIFIER = "llama-3.1-8b-instant"       # Model kecil untuk classify intent
+# ⭐ MODEL CONFIG
+MODEL_CHAT       = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODEL_CLASSIFIER = "llama-3.1-8b-instant"
 
-# Temperature (rendah = lebih akurat, tidak mengarang)
-TEMPERATURE_CHAT = 0.3
+# Temperature rendah = lebih akurat, tidak mengarang
+TEMPERATURE_CHAT = 0.2
 
 # Tuning parameters
-CHECK_INTERVAL   = 600   # auto-cek aktivitas tiap 10 menit
-STREAM_INTERVAL  = 1.5   # interval edit pesan saat streaming
-MAX_HISTORY      = 8     # max pesan history per user
-GARMIN_CACHE_TTL = 300   # cache data Garmin 5 menit
+CHECK_INTERVAL   = 600
+STREAM_INTERVAL  = 1.5
+MAX_HISTORY      = 8
+GARMIN_CACHE_TTL = 300
 
 # Timezone WITA = UTC+8
 WITA = timezone(timedelta(hours=8))
@@ -45,20 +45,18 @@ reported_activities = set()
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 
 # Cache data Garmin per user
-garmin_cache = {}  # {user_id: (timestamp, data)}
+garmin_cache = {}        # {user_id: (timestamp, data)}
+last_garmin_data = {}    # {user_id: data} — simpan data terakhir untuk follow_up
 
 
 # ── Konversi UTC → WITA ───────────────────────────────────────
 def convert_utc_to_wita(text: str) -> str:
-    """Konversi semua timestamp UTC dalam teks ke WITA (UTC+8)."""
-
     MONTHS = {
         'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
         'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
         'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
     }
 
-    # Format ISO 8601: "2026-04-26T20:54:00.000Z" atau "2026-04-26T20:54:00Z"
     def replace_iso(m):
         try:
             dt = datetime.fromisoformat(m.group(0).replace("Z", "+00:00"))
@@ -72,7 +70,6 @@ def convert_utc_to_wita(text: str) -> str:
         replace_iso, text
     )
 
-    # Format "26 Apr 2026 20:54 UTC"
     def replace_readable(m):
         try:
             day, mon, year, hour, minute = m.groups()
@@ -92,7 +89,6 @@ def convert_utc_to_wita(text: str) -> str:
         replace_readable, text
     )
 
-    # Format "2026-04-26 20:54:00 UTC" (dengan spasi, bukan T)
     def replace_space_iso(m):
         try:
             dt_str = m.group(0).replace(" UTC", "+00:00").replace(" ", "T", 1)
@@ -160,12 +156,10 @@ ATURAN:
 1. SAPAAN/CASUAL CHAT:
    - Balas natural dan singkat (1-3 kalimat)
    - JANGAN langsung kasih data atau analisis
-   - Contoh: "Halo! Apa kabar? Ada yang mau dicek dari aktivitas lari kamu?"
 
 2. PERTANYAAN SPESIFIK:
    - Jawab LANGSUNG dan SINGKAT, fokus ke yang ditanya saja
    - JANGAN kasih full report kalau cuma ditanya 1 hal
-   - Contoh: "HR rata-rata kamu 30 hari terakhir adalah **136 bpm**. Tergolong intensitas sedang ya 👍"
 
 3. ANALISIS LENGKAP (kalau diminta):
    - Pakai struktur lengkap dengan section + emoji:
@@ -193,12 +187,13 @@ ATURAN:
    - Kalau user nanya "kenapa?" atau "terus?", lanjutkan dari topik tadi
    - Jangan ulang info yang udah dikasih sebelumnya
 
-7. ANTI-HALUSINASI (WAJIB!):
-   - JANGAN PERNAH mengarang angka atau data yang tidak ada di data Garmin
-   - Kalau data Garmin tidak tersedia atau tidak relevan, bilang jujur:
-     "Data tidak tersedia, coba tanya yang lebih spesifik ya!"
-   - HANYA gunakan angka yang benar-benar ada di data yang diberikan
-   - Kalau tidak yakin, tanya balik ke user daripada mengarang"""
+7. ANTI-HALUSINASI — ATURAN PALING PENTING:
+   - HANYA gunakan angka dan fakta yang ADA di blok [Data Garmin] yang diberikan
+   - DILARANG KERAS mengarang, mengira-ngira, atau mengasumsikan angka apapun
+   - Jika data tidak tersedia dalam konteks, WAJIB jawab:
+     "Maaf, data untuk itu tidak tersedia. Coba tanya hal lain yang ada di data Garmin kamu ya!"
+   - Jika ragu apakah angka ada di data, lebih baik bilang tidak tahu
+   - JANGAN pernah mengisi kekosongan data dengan perkiraan atau pengetahuan umum"""
 
 
 # ── Klasifikasi intent ────────────────────────────────────────
@@ -256,18 +251,16 @@ async def call_mcp(tool_name: str, arguments: dict = {}) -> str:
 
 
 # ── Ambil data Garmin (DENGAN CACHE) ──────────────────────────
-async def fetch_garmin_data(user_id: int = 0) -> str:
-    """Fetch data Garmin dengan cache 5 menit per user."""
+async def fetch_garmin_data(user_id: int = 0):
+    """Return data string kalau berhasil, None kalau gagal/error."""
     now = time.time()
 
-    # Cek cache
     if user_id in garmin_cache:
         cached_time, cached_data = garmin_cache[user_id]
         if now - cached_time < GARMIN_CACHE_TTL:
             print(f"✓ Pakai cache Garmin (age: {int(now - cached_time)}s)")
             return cached_data
 
-    # Fetch baru
     today = date.today().isoformat()
     bulan_lalu = (date.today() - timedelta(days=30)).isoformat()
 
@@ -281,36 +274,74 @@ async def fetch_garmin_data(user_id: int = 0) -> str:
         "to_date": today
     })
 
-    data = f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
+    # Cek apakah ada error dari MCP
+    if "Error" in aktivitas or "Error" in stats:
+        print(f"✗ Garmin fetch gagal — aktivitas: {aktivitas[:80]} | stats: {stats[:80]}")
+        return None
 
-    # ✅ Konversi semua timestamp UTC → WITA sebelum disimpan ke cache
+    # Cek apakah data kosong/tidak bermakna
+    if not aktivitas.strip() or not stats.strip():
+        print("✗ Garmin fetch kosong")
+        return None
+
+    data = f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
     data = convert_utc_to_wita(data)
 
     garmin_cache[user_id] = (now, data)
+    last_garmin_data[user_id] = data
     print(f"✓ Fetch Garmin baru, cached (timestamp sudah WITA)")
 
     return data
+
+
+def get_garmin_context(user_id: int) -> str:
+    """
+    Ambil data Garmin dari cache/last_data tanpa fetch ulang.
+    Dipakai untuk follow_up supaya model tetap punya konteks data
+    dan tidak mengarang.
+    """
+    if user_id in garmin_cache:
+        _, cached_data = garmin_cache[user_id]
+        return cached_data
+    if user_id in last_garmin_data:
+        return last_garmin_data[user_id]
+    return ""
+
+
+# ── Bungkus pesan user dengan grounding eksplisit ─────────────
+def build_user_content(user_message: str, garmin_data: str, mode: str = "data") -> str:
+    """
+    mode='data'    : ada data Garmin, model harus pakai HANYA data ini
+    mode='no_data' : tidak ada data, model dilarang mengarang angka
+    """
+    if mode == "data" and garmin_data:
+        return (
+            f"{user_message}\n\n"
+            f"[Data Garmin — HANYA gunakan angka dari sini, jangan mengarang]:\n"
+            f"{garmin_data}\n"
+            f"[Akhir data Garmin]"
+        )
+    else:
+        return (
+            f"{user_message}\n\n"
+            f"[Catatan: Tidak ada data Garmin tersedia. "
+            f"Jangan mengarang data apapun. Jika user bertanya soal angka lari, "
+            f"minta mereka tanya lebih spesifik atau gunakan /ringkasan.]"
+        )
 
 
 # ── Streaming Groq dengan retry ──────────────────────────────
 async def stream_groq_to_telegram(
     user_id: int,
     user_message: str,
-    extra_context: str,
+    user_content: str,
     message,
     context: ContextTypes.DEFAULT_TYPE,
     max_retries: int = 2
 ) -> str:
-    """Stream response dengan auto-retry kalau rate limit."""
-
     messages = [{"role": "system", "content": COACH_SYSTEM_PROMPT}]
     history = list(conversation_history[user_id])
     messages.extend(history)
-
-    if extra_context:
-        user_content = f"{user_message}\n\n[Data Garmin tersedia:]\n{extra_context}"
-    else:
-        user_content = user_message
     messages.append({"role": "user", "content": user_content})
 
     for attempt in range(max_retries + 1):
@@ -325,7 +356,6 @@ async def stream_groq_to_telegram(
                     wait_time = float(match.group(1)) + 1
 
                 print(f"⚠ Rate limit, tunggu {wait_time}s...")
-
                 try:
                     await message.edit_text(
                         f"⏳ Server sibuk, tunggu sebentar ({int(wait_time)}s)..."
@@ -346,18 +376,14 @@ async def stream_groq_to_telegram(
         except APIError as e:
             print(f"Groq API error: {e}")
             try:
-                await message.edit_text(
-                    "❌ Ada error dari server AI. Coba lagi sebentar ya!"
-                )
+                await message.edit_text("❌ Ada error dari server AI. Coba lagi sebentar ya!")
             except:
                 pass
             return ""
         except Exception as e:
             print(f"Stream error: {e}")
             try:
-                await message.edit_text(
-                    f"❌ Terjadi error: {str(e)[:100]}\nCoba lagi ya!"
-                )
+                await message.edit_text(f"❌ Terjadi error: {str(e)[:100]}\nCoba lagi ya!")
             except:
                 pass
             return ""
@@ -366,8 +392,6 @@ async def stream_groq_to_telegram(
 
 
 async def _do_stream(user_id, user_message, messages, message, context):
-    """Helper internal untuk streaming."""
-
     def get_stream():
         return groq_client.chat.completions.create(
             model=MODEL_CHAT,
@@ -404,15 +428,13 @@ async def _do_stream(user_id, user_message, messages, message, context):
         now = asyncio.get_event_loop().time()
         if now - last_update_time >= STREAM_INTERVAL:
             html_text = safe_html_for_streaming(full_text) + " ▌"
-
             if html_text != last_sent_html:
                 try:
                     await message.edit_text(html_text, parse_mode=ParseMode.HTML)
                     last_sent_html = html_text
                     last_update_time = now
                     await context.bot.send_chat_action(
-                        chat_id=message.chat_id,
-                        action=ChatAction.TYPING
+                        chat_id=message.chat_id, action=ChatAction.TYPING
                     )
                 except RetryAfter as e:
                     await asyncio.sleep(e.retry_after)
@@ -437,7 +459,6 @@ async def _do_stream(user_id, user_message, messages, message, context):
         except Exception as e:
             print(f"Final edit error: {e}")
 
-    # Simpan ke history
     conversation_history[user_id].append({"role": "user", "content": user_message})
     conversation_history[user_id].append({"role": "assistant", "content": full_text})
 
@@ -464,7 +485,6 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
         if "Error" in hasil or not hasil.strip():
             return
 
-        # ✅ Konversi timestamp UTC → WITA di notif otomatis juga
         hasil = convert_utc_to_wita(hasil)
 
         if not reported_activities:
@@ -477,18 +497,17 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
             reported_activities.add(signature)
 
             try:
+                user_content = build_user_content(
+                    "Ada aktivitas lari baru baru aja kedeteksi! Kasih ringkasan singkat "
+                    "(jarak km, pace, durasi jam:menit) plus motivasi pendek.",
+                    hasil,
+                    mode="data"
+                )
                 response = groq_client.chat.completions.create(
                     model=MODEL_CHAT,
                     messages=[
                         {"role": "system", "content": COACH_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Data Garmin terbaru:\n{hasil}\n\n"
-                                "Ada aktivitas lari baru baru aja kedeteksi! Kasih ringkasan singkat "
-                                "(jarak km, pace, durasi jam:menit) plus motivasi pendek."
-                            )
-                        }
+                        {"role": "user", "content": user_content}
                     ],
                     max_tokens=400,
                     temperature=TEMPERATURE_CHAT
@@ -513,15 +532,10 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Error handler global ──────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tangani semua error yang lolos."""
     error = context.error
-
-    # Skip Conflict error (instance ganda) biar log nggak penuh
     if isinstance(error, Conflict):
         return
-
     print(f"⚠ Global error: {error}")
-
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -561,15 +575,17 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history[user_id].clear()
     if user_id in garmin_cache:
         del garmin_cache[user_id]
+    if user_id in last_garmin_data:
+        del last_garmin_data[user_id]
     await update.message.reply_text("✅ Percakapan di-reset. Mulai fresh dari sini ya!")
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Info model yang dipakai bot."""
     info = (
         f"🤖 <b>Model AI Info</b>\n\n"
         f"• <b>Chat utama:</b> <code>{MODEL_CHAT}</code>\n"
-        f"• <b>Classifier:</b> <code>{MODEL_CLASSIFIER}</code>\n\n"
+        f"• <b>Classifier:</b> <code>{MODEL_CLASSIFIER}</code>\n"
+        f"• <b>Temperature:</b> <code>{TEMPERATURE_CHAT}</code>\n\n"
         f"<i>Powered by Groq</i>"
     )
     await update.message.reply_text(info, parse_mode=ParseMode.HTML)
@@ -577,21 +593,17 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
-
     pesan = await update.message.reply_text("▌")
     data = await fetch_garmin_data(user_id)
-
-    await stream_groq_to_telegram(
-        user_id,
-        "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi (statistik utama, detail aktivitas, performa tubuh, dan insight).",
-        data,
-        pesan,
-        context
+    user_content = build_user_content(
+        "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi "
+        "(statistik utama, detail aktivitas, performa tubuh, dan insight).",
+        data, mode="data"
     )
+    await stream_groq_to_telegram(user_id, user_content, user_content, pesan, context)
 
 
 async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,7 +612,6 @@ async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     pesan = await update.message.reply_text("🔍 Mengecek koneksi...")
     hasil = await call_mcp("list_activities", {"limit": 1})
-
     if "Error" in hasil:
         await pesan.edit_text(f"❌ Gagal terhubung:\n{hasil}")
     else:
@@ -624,21 +635,48 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pesan = await update.message.reply_text("▌")
 
     if intent == "sapaan":
-        await stream_groq_to_telegram(user_id, pertanyaan, "", pesan, context)
+        # Sapaan murni — tidak perlu data Garmin
+        user_content = build_user_content(pertanyaan, "", mode="no_data")
+        await stream_groq_to_telegram(user_id, pertanyaan, user_content, pesan, context)
+
     elif intent == "lain":
-        await stream_groq_to_telegram(
-            user_id,
-            pertanyaan + "\n\n[Note: User nanya hal di luar konteks lari. Jawab ramah dan arahkan balik ke topik lari.]",
-            "",
-            pesan,
-            context
+        user_content = build_user_content(
+            pertanyaan + "\n\n[Note: Topik di luar lari. Jawab ramah dan arahkan balik ke topik lari.]",
+            "", mode="no_data"
         )
+        await stream_groq_to_telegram(user_id, pertanyaan, user_content, pesan, context)
+
     elif intent == "follow_up":
-        await stream_groq_to_telegram(user_id, pertanyaan, "", pesan, context)
+        # follow_up pakai data cache — kalau tidak ada, alert langsung
+        garmin_data = get_garmin_context(user_id)
+        if not garmin_data:
+            await pesan.edit_text(
+                "⚠️ Data Garmin belum tersedia.\n\n"
+                "Coba tanya dulu sesuatu yang spesifik, "
+                "atau ketik /ringkasan untuk muat data kamu."
+            )
+            return
+        user_content = build_user_content(pertanyaan, garmin_data, mode="data")
+        await stream_groq_to_telegram(user_id, pertanyaan, user_content, pesan, context)
+
     else:
-        # tanya_spesifik / analisis_lengkap / saran_latihan
+        # tanya_spesifik / analisis_lengkap / saran_latihan — fetch data dulu
         data = await fetch_garmin_data(user_id)
-        await stream_groq_to_telegram(user_id, pertanyaan, data, pesan, context)
+
+        # ✅ Kalau data tidak tersedia, alert langsung — TIDAK panggil model
+        if data is None:
+            await pesan.edit_text(
+                "❌ <b>Data Garmin tidak dapat diambil.</b>\n\n"
+                "Kemungkinan penyebab:\n"
+                "• Koneksi ke Garmin terputus\n"
+                "• Server Garmin sedang down\n\n"
+                "Coba lagi beberapa saat, atau ketik /cekkoneksi untuk cek status.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        user_content = build_user_content(pertanyaan, data, mode="data")
+        await stream_groq_to_telegram(user_id, pertanyaan, user_content, pesan, context)
 
 
 # ── Main ──────────────────────────────────────────────────────
@@ -646,15 +684,16 @@ def main():
     print("🤖 Running Assistant Bot berjalan...")
     print(f"   Chat model:       {MODEL_CHAT}")
     print(f"   Classifier model: {MODEL_CLASSIFIER}")
+    print(f"   Temperature:      {TEMPERATURE_CHAT}")
     print(f"   Timezone output:  WITA (UTC+8)")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("ringkasan",   cmd_ringkasan))
-    app.add_handler(CommandHandler("cekkoneksi",  cmd_cekkoneksi))
-    app.add_handler(CommandHandler("reset",       cmd_reset))
-    app.add_handler(CommandHandler("model",       cmd_model))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("ringkasan",  cmd_ringkasan))
+    app.add_handler(CommandHandler("cekkoneksi", cmd_cekkoneksi))
+    app.add_handler(CommandHandler("reset",      cmd_reset))
+    app.add_handler(CommandHandler("model",      cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
 
     app.add_error_handler(error_handler)
