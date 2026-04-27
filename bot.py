@@ -560,6 +560,22 @@ async def fetch_garmin_data(user_id: int = 0):
         print("✗ Garmin data kosong")
         return None
 
+    # ── DEBUG: print raw data untuk diagnosa field yang hilang ──
+    print("=" * 60)
+    print("RAW AKTIVITAS (500 char pertama):")
+    print(aktivitas_raw[:500])
+    print("=" * 60)
+    print("RAW STATS (500 char pertama):")
+    print(stats_raw[:500])
+    print("=" * 60)
+
+    # ── Cari field pace/speed di raw data ────────────────────
+    pace_fields = re.findall(
+        r'["\']?(\w*(?:pace|speed|velocity)\w*)["\']?\s*[=:]\s*([^\s,}\]]+)',
+        aktivitas_raw, re.IGNORECASE
+    )
+    print(f"Field pace/speed ditemukan: {pace_fields[:10]}")
+
     # ── Pre-process: konversi semua unit di Python ───────────
     aktivitas_proc = preprocess_garmin_json(aktivitas_raw)
     stats_proc     = preprocess_garmin_json(stats_raw)
@@ -946,6 +962,38 @@ async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_rawdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan raw data Garmin untuk diagnosa field yang hilang."""
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+    pesan = await update.message.reply_text("🔍 Mengambil raw data...")
+
+    today      = date.today().isoformat()
+    bulan_lalu = (date.today() - timedelta(days=7)).isoformat()
+
+    raw = await call_mcp("list_activities", {
+        "limit": 3, "from_date": bulan_lalu, "to_date": today
+    })
+
+    if "Error" in raw:
+        await pesan.edit_text(f"❌ {raw}")
+        return
+
+    # Kirim raw data dalam potongan max 4000 char
+    chunks = [raw[i:i+3800] for i in range(0, min(len(raw), 7600), 3800)]
+    await pesan.edit_text(
+        f"📦 <b>Raw data Garmin ({len(raw)} char):</b>\n\n"
+        f"<code>{chunks[0][:3800]}</code>",
+        parse_mode=ParseMode.HTML
+    )
+    if len(chunks) > 1:
+        await update.message.reply_text(
+            f"<code>{chunks[1][:3800]}</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+
 # ════════════════════════════════════════════════════════════
 #  MESSAGE HANDLER UTAMA
 # ════════════════════════════════════════════════════════════
@@ -1013,6 +1061,7 @@ def main():
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("ringkasan",   cmd_ringkasan))
     app.add_handler(CommandHandler("cekkoneksi",  cmd_cekkoneksi))
+    app.add_handler(CommandHandler("rawdata",     cmd_rawdata))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("model",       cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
