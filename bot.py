@@ -25,7 +25,6 @@ CHAT_ID        = os.environ.get("CHAT_ID")
 
 # ⭐ MODEL CONFIG
 MODEL_CHAT       = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODEL_CLASSIFIER = "llama-3.1-8b-instant"
 
 # Temperature rendah = lebih akurat, tidak mengarang
 TEMPERATURE_CHAT = 0.2
@@ -131,21 +130,6 @@ def safe_html_for_streaming(text: str) -> str:
 
 
 # ── System prompts ────────────────────────────────────────────
-INTENT_CLASSIFIER_PROMPT = """Klasifikasikan pesan user ke salah satu kategori. Baca dengan teliti sebelum memilih.
-
-KATEGORI:
-- "sapaan": HANYA pesan kasual MURNI tanpa meminta data apapun. Contoh: "halo", "hi", "pagi", "makasih", "oke", "mantap". BUKAN sapaan jika ada kata: data, lari, tanggal, pace, jarak, HR, aktivitas, berikan, kasih, lihat, cek, analisis.
-- "tanya_spesifik": Meminta data/info TERTENTU. Contoh: "data tanggal X", "pace kemarin", "berapa jarak hari ini", "HR tadi", "lari terakhir", "berikan data", "lihat aktivitas".
-- "analisis_lengkap": Minta analisis/ringkasan menyeluruh. Contoh: "analisis dong", "ringkasan bulan ini", "evaluasi performa".
-- "saran_latihan": Minta saran atau rekomendasi latihan.
-- "follow_up": Pertanyaan lanjutan SANGAT SINGKAT tanpa topik baru. Contoh: "kenapa?", "terus?", "detailnya", "maksudnya?".
-- "lain": Topik di luar lari/Garmin sama sekali.
-
-PENTING: Jika pesan mengandung kata seperti "data", "tanggal", "berikan", "lihat", "cek", "aktivitas", "lari" → JANGAN pilih "sapaan".
-
-Jawab HANYA satu kata kategori."""
-
-
 COACH_SYSTEM_PROMPT = """Kamu adalah Running Assistant, pelatih lari pribadi yang ramah dan conversational.
 
 KARAKTER:
@@ -201,33 +185,65 @@ ATURAN:
    - JANGAN pernah mengisi kekosongan data dengan perkiraan atau pengetahuan umum"""
 
 
-# ── Klasifikasi intent ────────────────────────────────────────
-async def classify_intent(message: str) -> str:
-    try:
-        loop = asyncio.get_event_loop()
+# ── Klasifikasi intent (pakai regex, tanpa API call) ─────────
+# Lebih cepat, tidak boros token, dan lebih akurat untuk bahasa Indonesia
 
-        def _classify():
-            return groq_client.chat.completions.create(
-                model=MODEL_CLASSIFIER,
-                messages=[
-                    {"role": "system", "content": INTENT_CLASSIFIER_PROMPT},
-                    {"role": "user", "content": message}
-                ],
-                max_tokens=20,
-                temperature=0.1
-            )
+# Kata kunci yang PASTI butuh data Garmin
+_DATA_KEYWORDS = re.compile(
+    r'\b(data|lari|aktivitas|tanggal|pace|jarak|km|hr|denyut|nadi|kalori|'
+    r'durasi|waktu|kecepatan|statistik|ringkasan|analisis|evaluasi|performa|'
+    r'latihan|saran|rekomendasi|berikan|kasih|lihat|cek|tampilkan|tunjukkan|'
+    r'bulan|minggu|hari|kemarin|tadi|terakhir|terbaru|terbaik|terjauh|'
+    r'tercepat|average|rata|total|summary|report|hasil)\b',
+    re.IGNORECASE
+)
 
-        response = await loop.run_in_executor(None, _classify)
-        intent = response.choices[0].message.content.strip().lower()
+# Sapaan murni — hanya cocok kalau SELURUH pesan pendek dan tidak ada kata data
+_SAPAAN_ONLY = re.compile(
+    r'^(halo|hallo|hai|hi|hey|pagi|siang|sore|malam|'
+    r'oke|ok|iya|ya|siap|makasih|terima kasih|thx|thanks|'
+    r'mantap|keren|bagus|sip|lanjut|done|selesai|'
+    r'hehe|wkwk|😊|👍|🙏)[\s!.]*$',
+    re.IGNORECASE
+)
 
-        valid = ["sapaan", "tanya_spesifik", "analisis_lengkap", "saran_latihan", "follow_up", "lain"]
-        for v in valid:
-            if v in intent:
-                return v
+# Follow-up pendek
+_FOLLOW_UP = re.compile(
+    r'^(kenapa|knp|mengapa|terus|trus|lalu|lanjut|detailnya|'
+    r'detail|maksudnya|maksud|gimana|bagaimana|contohnya|misalnya|'
+    r'jelaskan|jelasin|lebih lanjut|selengkapnya)\??\s*$',
+    re.IGNORECASE
+)
+
+def classify_intent(message: str) -> str:
+    msg = message.strip()
+
+    # Cek follow-up pendek dulu
+    if _FOLLOW_UP.match(msg):
+        return "follow_up"
+
+    # Cek sapaan murni (pesan pendek tanpa kata data)
+    if _SAPAAN_ONLY.match(msg) and not _DATA_KEYWORDS.search(msg):
+        return "sapaan"
+
+    # Kalau ada kata kunci data → langsung tanya_spesifik atau analisis
+    if _DATA_KEYWORDS.search(msg):
+        analisis_words = re.search(
+            r'\b(analisis|ringkasan|evaluasi|summary|report|lengkap|menyeluruh|semua)\b',
+            msg, re.IGNORECASE
+        )
+        saran_words = re.search(
+            r'\b(saran|rekomendasi|tips|improve|tingkatkan|sebaiknya|harus)\b',
+            msg, re.IGNORECASE
+        )
+        if analisis_words:
+            return "analisis_lengkap"
+        if saran_words:
+            return "saran_latihan"
         return "tanya_spesifik"
-    except Exception as e:
-        print(f"Intent classify error: {e}")
-        return "tanya_spesifik"
+
+    # Default: anggap butuh data (lebih aman dari pada anggap sapaan)
+    return "tanya_spesifik"
 
 
 # ── Panggil tool MCP ──────────────────────────────────────────
@@ -589,7 +605,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = (
         f"🤖 <b>Model AI Info</b>\n\n"
         f"• <b>Chat utama:</b> <code>{MODEL_CHAT}</code>\n"
-        f"• <b>Classifier:</b> <code>{MODEL_CLASSIFIER}</code>\n"
+        f"• <b>Classifier:</b> <code>regex (built-in)</code>\n"
         f"• <b>Temperature:</b> <code>{TEMPERATURE_CHAT}</code>\n\n"
         f"<i>Powered by Groq</i>"
     )
@@ -634,7 +650,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
-    intent = await classify_intent(pertanyaan)
+    intent = classify_intent(pertanyaan)  # sync, tidak perlu await
     print(f"Intent: {intent} | Pesan: {pertanyaan[:50]}")
 
     pesan = await update.message.reply_text("▌")
