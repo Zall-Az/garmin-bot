@@ -21,59 +21,112 @@ GROQ_API_KEY   = os.environ.get("GROQ_API_KEY")
 MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID        = os.environ.get("CHAT_ID")
 CHECK_INTERVAL = 300
-STREAM_INTERVAL = 1.5  # naikin dikit biar lebih aman
+STREAM_INTERVAL = 1.5
 # ============================================================
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 reported_activities = set()
 
 
-# ── Convert markdown → HTML untuk Telegram ────────────────────
+# ── Convert markdown ke HTML Telegram ─────────────────────────
 def markdown_to_html(text: str) -> str:
-    """
-    Convert markdown standar ke HTML Telegram.
-    Telegram HTML support: <b>, <i>, <u>, <s>, <code>, <pre>, <a>
-    """
-    # Escape HTML special chars dulu (penting!)
+    """Convert markdown standar ke HTML Telegram."""
+    # Escape HTML special chars
     text = text.replace("&", "&amp;")
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
 
-    # **bold** atau __bold__ → <b>bold</b>
+    # Convert "* item" / "- item" di awal baris → "• item"
+    text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)
+
+    # **bold** → <b>bold</b>
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
     text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
 
-    # *italic* → <i>italic</i> (hati-hati: harus single asterisk yang BUKAN list)
-    # Pattern: * yang diapit char non-spasi
-    text = re.sub(r'(?<![*\w])\*([^\*\n]+?)\*(?!\*)', r'<i>\1</i>', text)
-
     # `code` → <code>code</code>
     text = re.sub(r'`([^`\n]+?)`', r'<code>\1</code>', text)
+
+    # Hapus single asterisk yang nyangkut
+    text = re.sub(r'(?<!\w)\*(?!\w)', '', text)
 
     return text
 
 
 def safe_html_for_streaming(text: str) -> str:
-    """
-    Untuk streaming: kalau text masih on-going, mungkin ada tag yang belum ditutup.
-    Fungsi ini convert ke HTML, terus tutup tag yang masih buka.
-    """
+    """Untuk streaming - tutup tag HTML yang masih kebuka."""
     html = markdown_to_html(text)
 
-    # Hitung tag yang belum ditutup
     open_b = html.count("<b>") - html.count("</b>")
-    open_i = html.count("<i>") - html.count("</i>")
     open_code = html.count("<code>") - html.count("</code>")
 
-    # Tutup yang masih kebuka
     if open_code > 0:
         html += "</code>" * open_code
-    if open_i > 0:
-        html += "</i>" * open_i
     if open_b > 0:
         html += "</b>" * open_b
 
     return html
+
+
+# ── System prompt ─────────────────────────────────────────────
+SYSTEM_PROMPT = """Kamu adalah pelatih lari pribadi yang ramah dan cerdas.
+Jawab berdasarkan data Garmin yang diberikan dalam Bahasa Indonesia.
+
+═══ ATURAN FORMAT WAJIB ═══
+
+1. STRUKTUR JAWABAN:
+   - Mulai dengan sapaan singkat 1 kalimat
+   - Bagi dalam SECTION dengan judul emoji (lihat contoh di bawah)
+   - Tutup dengan motivasi/saran 1-2 kalimat
+
+2. JUDUL SECTION (pakai emoji + bold):
+   📊 **Statistik Utama**
+   🏃 **Detail Aktivitas**
+   ❤️ **Performa Tubuh**
+   💡 **Insight & Saran**
+
+3. FORMATTING TEXT:
+   - Bold pakai **double asterisk** untuk angka penting dan nama aktivitas
+   - Bullet list pakai • (bullet character), JANGAN pakai * atau -
+   - Pisahkan section dengan baris kosong
+
+4. ATURAN ANGKA (PENTING!):
+   - Jarak: HANYA km dengan 1-2 desimal. Contoh: "12,5 km"
+     ❌ JANGAN: "12500 meter" atau "12500 m" atau "12,5 km (12500 meter)"
+   - Durasi: format jam dan menit. Contoh: "23 jam 30 menit"
+     ❌ JANGAN: "84769 detik" atau "84769 s"
+   - Pace: format menit:detik per km. Contoh: "5:30/km"
+   - Heart rate: bulatkan, tambah 'bpm'. Contoh: "136 bpm"
+   - Kalori: tambah "kcal". Contoh: "8.431 kcal"
+   - JANGAN PERNAH tampilkan satuan raw (meter, detik) di output
+
+5. CONTOH JAWABAN YANG BENAR:
+
+Halo! Berikut analisis performa lari kamu 30 hari terakhir.
+
+📊 **Statistik Utama**
+- Total aktivitas: **24 sesi**
+- Total jarak: **124,3 km**
+- Total durasi: **23 jam 30 menit**
+- Kalori terbakar: **8.431 kcal**
+
+🏃 **Detail Aktivitas**
+- Lari: **16 sesi** (103,4 km)
+- Strength training: **5 sesi**
+- Padel: **1 sesi**
+- Jalan kaki: **2 sesi**
+
+❤️ **Performa Tubuh**
+- HR rata-rata: **136 bpm**
+- HR maksimum: **174 bpm**
+
+💡 **Insight**
+Konsistensi kamu keren banget! Coba tingkatkan jarak per sesi minggu depan untuk progress yang lebih baik.
+
+═══ JAWABAN YANG SALAH (JANGAN!) ═══
+❌ "124252,71 meter (sekitar 124,25 km)"  → harus "124,3 km" saja
+❌ "* item list"  → harus "• item list"
+❌ "84769 detik (sekitar 23,5 jam)"  → harus "23 jam 30 menit" saja
+"""
 
 
 # ── Panggil tool MCP ──────────────────────────────────────────
@@ -119,7 +172,7 @@ async def fetch_garmin_data() -> str:
     return f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
 
 
-# ── Streaming Groq ke Telegram (HTML mode) ───────────────────
+# ── Streaming Groq ke Telegram ───────────────────────────────
 async def stream_groq_to_telegram(
     pertanyaan: str,
     data_garmin: str,
@@ -132,20 +185,7 @@ async def stream_groq_to_telegram(
         return groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Kamu adalah asisten pelatih lari pribadi yang cerdas. "
-                        "Jawab berdasarkan data Garmin yang diberikan. "
-                        "Gunakan Bahasa Indonesia yang ramah dan motivatif. "
-                        "Berikan insight berguna tentang performa lari.\n\n"
-                        "FORMAT PENTING:\n"
-                        "- Gunakan **bold** (double asterisk) untuk judul/poin penting\n"
-                        "- Gunakan bullet '•' untuk list (BUKAN tanda '*')\n"
-                        "- Pisahkan section dengan baris kosong\n"
-                        "- JANGAN pakai single asterisk '*' untuk list, gunakan '•'"
-                    )
-                },
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"Data Garmin saya:\n{data_garmin}\n\nPertanyaan: {pertanyaan}"
@@ -183,7 +223,7 @@ async def stream_groq_to_telegram(
         now = asyncio.get_event_loop().time()
         if now - last_update_time >= STREAM_INTERVAL:
             html_text = safe_html_for_streaming(full_text) + " ▌"
-            
+
             if html_text != last_sent_html:
                 try:
                     await message.edit_text(
@@ -200,21 +240,20 @@ async def stream_groq_to_telegram(
                 except RetryAfter as e:
                     await asyncio.sleep(e.retry_after)
                 except BadRequest as e:
-                    # Kalau HTML masih invalid, tunggu chunk berikutnya
                     if "can't parse entities" in str(e).lower():
                         pass
                 except Exception as e:
                     print(f"Stream edit error: {e}")
 
-    # Final update — tanpa cursor
+    # Final update tanpa cursor
     if full_text:
         final_html = markdown_to_html(full_text)
         try:
             await message.edit_text(final_html, parse_mode=ParseMode.HTML)
         except BadRequest as e:
             if "can't parse entities" in str(e).lower():
-                # Last resort: kirim plain text TANPA tanda markdown
                 clean_text = re.sub(r'\*+', '', full_text)
+                clean_text = re.sub(r'^\s*[\-]\s+', '• ', clean_text, flags=re.MULTILINE)
                 try:
                     await message.edit_text(clean_text)
                 except BadRequest:
@@ -257,19 +296,13 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Kamu pelatih lari yang ramah. Jawab dalam Bahasa Indonesia. "
-                            "Gunakan **bold** untuk poin penting dan '•' untuk list."
-                        )
-                    },
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
                             f"Data Garmin terbaru:\n{hasil}\n\n"
                             "Ada aktivitas lari baru! Berikan ringkasan singkat dan motivasi. "
-                            "Sebutkan jarak, pace, dan durasinya."
+                            "Sebutkan jarak (km), pace, dan durasi (jam:menit)."
                         )
                     }
                 ],
@@ -277,7 +310,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 temperature=0.7
             )
             ringkasan = response.choices[0].message.content
-            html_text = f"🏃 <b>Aktivitas Lari Baru Terdeteksi!</b>\n\n{markdown_to_html(ringkasan)}"
+            html_text = f"🏃 <b>Aktivitas Lari Baru!</b>\n\n{markdown_to_html(ringkasan)}"
 
             try:
                 await context.bot.send_message(
@@ -289,7 +322,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 clean = re.sub(r'\*+', '', ringkasan)
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"🏃 Aktivitas Lari Baru Terdeteksi!\n\n{clean}"
+                    text=f"🏃 Aktivitas Lari Baru!\n\n{clean}"
                 )
 
     except Exception as e:
@@ -300,18 +333,21 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nama = update.effective_user.first_name
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"👟 Halo <b>{nama}</b>! Saya bot pelatih larimu.\n\n"
-        f"📌 Chat ID kamu: <code>{chat_id}</code>\n"
-        "(set sebagai env <code>CHAT_ID</code> di Railway untuk auto-notif)\n\n"
-        "Tanya apapun tentang aktivitas Garmin kamu:\n\n"
-        "• Berapa total lari saya bulan ini?\n"
-        "• Gimana pace rata-rata saya?\n"
-        "• Aktivitas terakhir saya apa?\n\n"
-        "/ringkasan — ringkasan 30 hari terakhir\n"
-        "/cekkoneksi — cek koneksi Garmin",
-        parse_mode=ParseMode.HTML
+    welcome = (
+        f"👟 Halo <b>{nama}</b>!\n\n"
+        f"Saya <b>Running Assistant</b>, pelatih lari pribadimu yang siap "
+        f"menganalisis data Garmin kamu kapan aja.\n\n"
+        f"📌 Chat ID: <code>{chat_id}</code>\n\n"
+        f"<b>Coba tanya apa aja:</b>\n"
+        f"• Berapa total lari saya bulan ini?\n"
+        f"• Gimana pace rata-rata saya?\n"
+        f"• Aktivitas terakhir saya apa?\n"
+        f"• Kasih saran latihan dong\n\n"
+        f"<b>Command:</b>\n"
+        f"/ringkasan — analisis lengkap 30 hari\n"
+        f"/cekkoneksi — tes koneksi Garmin"
     )
+    await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
 
 async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,12 +357,11 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     pesan = await update.message.reply_text("▌")
-
     data = await fetch_garmin_data()
 
     await stream_groq_to_telegram(
-        "Berikan ringkasan lengkap aktivitas lari 30 hari terakhir: "
-        "total jarak, jumlah sesi, pace terbaik, kalori, dan tren performa.",
+        "Berikan ringkasan lengkap aktivitas lari 30 hari terakhir dengan format "
+        "section yang rapi (statistik utama, detail aktivitas, performa tubuh, dan insight).",
         data,
         pesan,
         context
@@ -344,7 +379,7 @@ async def cmd_cekkoneksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Error" in hasil:
         await pesan.edit_text(f"❌ Gagal terhubung:\n{hasil}")
     else:
-        await pesan.edit_text("✅ Koneksi ke Garmin berhasil! Data bisa dibaca.")
+        await pesan.edit_text("✅ <b>Koneksi Garmin berhasil!</b>\nData siap dianalisis.", parse_mode=ParseMode.HTML)
 
 
 async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -356,15 +391,13 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     pesan = await update.message.reply_text("▌")
-
     data = await fetch_garmin_data()
-
     await stream_groq_to_telegram(pertanyaan, data, pesan, context)
 
 
 # ── Main ──────────────────────────────────────────────────────
 def main():
-    print("🤖 Running Assistant Bot berjalan (HTML streaming)...")
+    print("🤖 Running Assistant Bot berjalan...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",       cmd_start))
