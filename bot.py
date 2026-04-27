@@ -704,7 +704,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🤖 Running Assistant Bot berjalan...")
     print(f"   Chat model:       {MODEL_CHAT}")
-    print(f"   Classifier model: {MODEL_CLASSIFIER}")
+    print(f"   Classifier model: regex (built-in)")
     print(f"   Temperature:      {TEMPERATURE_CHAT}")
     print(f"   Timezone output:  WITA (UTC+8)")
 
