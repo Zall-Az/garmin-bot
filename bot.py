@@ -13,7 +13,8 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
 
 # ============================================================
@@ -24,7 +25,7 @@ GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
 MCP_URL             = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID             = os.environ.get("CHAT_ID")
 
-MODEL_CHAT       = "gemini-2.5-flash-preview-04-17"
+MODEL_CHAT       = "gemini-2.5-flash-preview-05-20"
 TEMPERATURE_CHAT = 0.1          # sangat rendah → lebih faktual, minim halusinasi
 
 CHECK_INTERVAL   = 600
@@ -35,8 +36,8 @@ GARMIN_CACHE_TTL = 300
 WITA = timezone(timedelta(hours=8))
 # ============================================================
 
-# Inisialisasi Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+# Inisialisasi Gemini (SDK baru)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ── Rate limiter (free tier = 5 RPM) ─────────────────────────
 import threading
@@ -675,17 +676,31 @@ async def stream_to_telegram(
 async def _do_stream(user_id, user_message, user_content, history_gemini, message, context):
     loop = asyncio.get_event_loop()
 
+    # Bangun history format SDK baru
+    contents = []
+    for h in history_gemini:
+        contents.append(types.Content(
+            role=h["role"],
+            parts=[types.Part(text=h["parts"][0])]
+        ))
+    # Tambah pesan user sekarang
+    contents.append(types.Content(
+        role="user",
+        parts=[types.Part(text=user_content)]
+    ))
+
+    config = types.GenerateContentConfig(
+        system_instruction=COACH_SYSTEM_PROMPT,
+        temperature=TEMPERATURE_CHAT,
+        max_output_tokens=1024,
+    )
+
     def get_stream():
-        model = genai.GenerativeModel(
-            model_name=MODEL_CHAT,
-            system_instruction=COACH_SYSTEM_PROMPT,
-            generation_config=genai.GenerationConfig(
-                temperature=TEMPERATURE_CHAT,
-                max_output_tokens=1024,
-            )
+        return gemini_client.models.generate_content_stream(
+            model=MODEL_CHAT,
+            contents=contents,
+            config=config,
         )
-        chat = model.start_chat(history=history_gemini)
-        return chat.send_message(user_content, stream=True)
 
     async def _call():
         return await loop.run_in_executor(None, get_stream)
@@ -792,17 +807,20 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 hasil, mode="data"
             )
             try:
-                _model = genai.GenerativeModel(
-                    model_name=MODEL_CHAT,
+                _config = types.GenerateContentConfig(
                     system_instruction=COACH_SYSTEM_PROMPT,
-                    generation_config=genai.GenerationConfig(
-                        temperature=TEMPERATURE_CHAT,
-                        max_output_tokens=350,
-                    )
+                    temperature=TEMPERATURE_CHAT,
+                    max_output_tokens=350,
                 )
+                _contents = [types.Content(role="user", parts=[types.Part(text=user_content)])]
                 loop = asyncio.get_event_loop()
                 async def _notif_call():
-                    return await loop.run_in_executor(None, lambda: _model.generate_content(user_content))
+                    r = await loop.run_in_executor(None, lambda: gemini_client.models.generate_content(
+                        model=MODEL_CHAT,
+                        contents=_contents,
+                        config=_config,
+                    ))
+                    return r
                 resp = await rate_limited_call(_notif_call)
                 ringkasan = resp.text
                 html_text = (
