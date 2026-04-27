@@ -24,7 +24,7 @@ MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-
 CHAT_ID        = os.environ.get("CHAT_ID")
 
 # ⭐ MODEL CONFIG (gampang ganti di sini)
-MODEL_CHAT       = "meta-llama/llama-4-scout-17b-16e-instruct"    # Model utama untuk jawab user (stabil, anti-halu)
+MODEL_CHAT       = "openai/gpt-oss-120b"    # Model utama untuk jawab user (stabil, anti-halu)
 MODEL_CLASSIFIER = "llama-3.1-8b-instant"       # Model kecil untuk classify intent
 
 # Temperature (rendah = lebih akurat, tidak mengarang)
