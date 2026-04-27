@@ -13,19 +13,18 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
-from openai import OpenAI, RateLimitError, APIError
+import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
 
 # ============================================================
 # KONFIGURASI
 # ============================================================
-TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
 MCP_URL             = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID             = os.environ.get("CHAT_ID")
 
-# Model OpenRouter — ganti sesuai kebutuhan, contoh lain:
-# "openai/gpt-4o-mini", "anthropic/claude-3-haiku", "google/gemini-flash-1.5"
-MODEL_CHAT       = "anthropic/claude-opus-4-7"
+MODEL_CHAT       = "gemini-2.5-flash-preview-04-17"
 TEMPERATURE_CHAT = 0.1          # sangat rendah → lebih faktual, minim halusinasi
 
 CHECK_INTERVAL   = 600
@@ -36,14 +35,28 @@ GARMIN_CACHE_TTL = 300
 WITA = timezone(timedelta(hours=8))
 # ============================================================
 
-openrouter_client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": "https://github.com/running-assistant-bot",
-        "X-Title": "Running Assistant Bot",
-    }
-)
+# Inisialisasi Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ── Rate limiter (free tier = 5 RPM) ─────────────────────────
+import threading
+_api_lock      = asyncio.Lock()   # cegah concurrent API call
+_last_api_call = 0.0              # timestamp call terakhir
+_MIN_INTERVAL  = 13.0             # 60s / 5 RPM = 12s, pakai 13s untuk safety
+
+async def rate_limited_call(coro_factory):
+    """Wrap coroutine factory agar jarak antar call >= _MIN_INTERVAL."""
+    global _last_api_call
+    async with _api_lock:
+        now   = asyncio.get_event_loop().time()
+        wait  = _MIN_INTERVAL - (now - _last_api_call)
+        if wait > 0:
+            print(f"⏱ Rate limit wait: {wait:.1f}s")
+            await asyncio.sleep(wait)
+        result = await coro_factory()
+        _last_api_call = asyncio.get_event_loop().time()
+        return result
+
 reported_activities  = set()
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY * 2))
 
@@ -600,7 +613,7 @@ def build_user_content(user_message: str, garmin_data: str, mode: str = "data") 
 
 
 # ════════════════════════════════════════════════════════════
-#  STREAMING OPENROUTER
+#  STREAMING GEMINI
 # ════════════════════════════════════════════════════════════
 
 async def stream_to_telegram(
@@ -611,37 +624,40 @@ async def stream_to_telegram(
     context: ContextTypes.DEFAULT_TYPE,
     max_retries: int = 2
 ) -> str:
-    messages = [{"role": "system", "content": COACH_SYSTEM_PROMPT}]
-    messages.extend(list(conversation_history[user_id]))
-    messages.append({"role": "user", "content": user_content})
+    # Bangun history dalam format Gemini
+    history_gemini = []
+    for msg in list(conversation_history[user_id]):
+        role = "user" if msg["role"] == "user" else "model"
+        history_gemini.append({"role": role, "parts": [msg["content"]]})
 
     for attempt in range(max_retries + 1):
         try:
-            return await _do_stream(user_id, user_message, messages, message, context)
+            return await _do_stream(user_id, user_message, user_content,
+                                    history_gemini, message, context)
 
-        except RateLimitError as e:
+        except ResourceExhausted as e:
             if attempt < max_retries:
-                wait_time = 30
-                m = re.search(r'try again in ([\d.]+)s', str(e))
+                wait_time = 60
+                m = re.search(r'retry_delay.*?seconds: (\d+)', str(e))
                 if m:
-                    wait_time = float(m.group(1)) + 1
-                print(f"⚠ Rate limit, tunggu {wait_time:.0f}s...")
+                    wait_time = int(m.group(1)) + 2
+                print(f"⚠ Gemini rate limit, tunggu {wait_time}s...")
                 try:
-                    await message.edit_text(f"⏳ Server sibuk, tunggu {int(wait_time)}s...")
+                    await message.edit_text(f"⏳ Server sibuk, tunggu {wait_time}s...")
                 except Exception:
                     pass
                 await asyncio.sleep(wait_time)
                 continue
             try:
-                await message.edit_text("😅 Server sibuk. Coba lagi 1-2 menit ya!")
+                await message.edit_text("😅 Server Gemini sibuk. Coba lagi 1-2 menit ya!")
             except Exception:
                 pass
             return ""
 
-        except APIError as e:
-            print(f"OpenRouter API error: {e}")
+        except GoogleAPIError as e:
+            print(f"Gemini API error: {e}")
             try:
-                await message.edit_text("❌ Error dari server AI. Coba lagi ya!")
+                await message.edit_text("❌ Error dari Gemini. Coba lagi ya!")
             except Exception:
                 pass
             return ""
@@ -656,24 +672,28 @@ async def stream_to_telegram(
     return ""
 
 
-async def _do_stream(user_id, user_message, messages, message, context):
+async def _do_stream(user_id, user_message, user_content, history_gemini, message, context):
     loop = asyncio.get_event_loop()
 
     def get_stream():
-        return openrouter_client.chat.completions.create(
-            model=MODEL_CHAT,
-            messages=messages,
-            max_tokens=1024,
-            temperature=TEMPERATURE_CHAT,
-            stream=True
+        model = genai.GenerativeModel(
+            model_name=MODEL_CHAT,
+            system_instruction=COACH_SYSTEM_PROMPT,
+            generation_config=genai.GenerationConfig(
+                temperature=TEMPERATURE_CHAT,
+                max_output_tokens=1024,
+            )
         )
+        chat = model.start_chat(history=history_gemini)
+        return chat.send_message(user_content, stream=True)
 
-    stream = await loop.run_in_executor(None, get_stream)
+    async def _call():
+        return await loop.run_in_executor(None, get_stream)
+    stream = await rate_limited_call(_call)
 
     full_text        = ""
     last_update_time = 0
     last_sent_html   = ""
-    stream_iter      = iter(stream)
 
     def get_next_chunk(it):
         try:
@@ -681,13 +701,18 @@ async def _do_stream(user_id, user_message, messages, message, context):
         except StopIteration:
             return None
 
+    stream_iter = iter(stream)
+
     while True:
         chunk = await loop.run_in_executor(None, get_next_chunk, stream_iter)
         if chunk is None:
             break
-        delta = chunk.choices[0].delta.content
-        if delta:
-            full_text += delta
+        try:
+            delta = chunk.text
+            if delta:
+                full_text += delta
+        except Exception:
+            pass
 
         now = loop.time()
         if now - last_update_time >= STREAM_INTERVAL:
@@ -767,16 +792,19 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 hasil, mode="data"
             )
             try:
-                resp = openrouter_client.chat.completions.create(
-                    model=MODEL_CHAT,
-                    messages=[
-                        {"role": "system", "content": COACH_SYSTEM_PROMPT},
-                        {"role": "user",   "content": user_content}
-                    ],
-                    max_tokens=350,
-                    temperature=TEMPERATURE_CHAT
+                _model = genai.GenerativeModel(
+                    model_name=MODEL_CHAT,
+                    system_instruction=COACH_SYSTEM_PROMPT,
+                    generation_config=genai.GenerationConfig(
+                        temperature=TEMPERATURE_CHAT,
+                        max_output_tokens=350,
+                    )
                 )
-                ringkasan = resp.choices[0].message.content
+                loop = asyncio.get_event_loop()
+                async def _notif_call():
+                    return await loop.run_in_executor(None, lambda: _model.generate_content(user_content))
+                resp = await rate_limited_call(_notif_call)
+                ringkasan = resp.text
                 html_text = (
                     f"🏃 <b>Aktivitas Lari Baru!</b>\n\n"
                     f"{markdown_to_html(ringkasan)}"
@@ -784,8 +812,8 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=CHAT_ID, text=html_text, parse_mode=ParseMode.HTML
                 )
-            except RateLimitError:
-                print("⚠ Rate limit di auto-notif, skip")
+            except ResourceExhausted:
+                print("⚠ Gemini rate limit di auto-notif, skip")
             except BadRequest:
                 clean = re.sub(r'\*+', '', ringkasan)
                 await context.bot.send_message(
@@ -856,7 +884,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Classifier:</b> <code>regex (built-in)</code>\n"
         f"• <b>Temperature:</b> <code>{TEMPERATURE_CHAT}</code>\n"
         f"• <b>Timezone:</b> <code>WITA (UTC+8)</code>\n\n"
-        f"<i>Powered by OpenRouter</i>"
+        f"<i>Powered by Google Gemini</i>"
     )
     await update.message.reply_text(info, parse_mode=ParseMode.HTML)
 
@@ -957,7 +985,7 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("🤖 Running Assistant Bot berjalan...")
-    print(f"   Chat model  : {MODEL_CHAT}")
+    print(f"   Chat model  : {MODEL_CHAT} (Gemini)")
     print(f"   Classifier  : regex (built-in)")
     print(f"   Temperature : {TEMPERATURE_CHAT}")
     print(f"   Timezone    : WITA (UTC+8)")
