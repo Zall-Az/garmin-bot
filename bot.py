@@ -285,6 +285,25 @@ def _process_json_obj(obj) -> str:
             else:
                 result[k] = v
 
+        # ── Hitung pace dari duration + distance kalau belum ada ──
+        has_pace = any(
+            any(x in k.lower() for x in ['pace', 'speed'])
+            for k in result
+        )
+        if not has_pace:
+            dur  = obj.get('duration_seconds') or obj.get('duration') or obj.get('elapsed_time')
+            dist = obj.get('distance_meters')  or obj.get('distance')
+            try:
+                dur_f  = float(dur)
+                dist_f = float(dist)
+                if dur_f > 0 and dist_f > 100:   # dist > 100m = aktivitas lari beneran
+                    spk = (dur_f / dist_f) * 1000  # detik per km
+                    mnt = int(spk // 60)
+                    sec = int(spk % 60)
+                    result['pace'] = f"{mnt}:{sec:02d}/km"
+            except Exception:
+                pass
+
         # Format sebagai teks terstruktur
         lines = []
         for k, v in result.items():
