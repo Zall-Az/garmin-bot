@@ -4,7 +4,8 @@ import re
 import json
 import asyncio
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import defaultdict, deque
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
@@ -15,6 +16,18 @@ from telegram.ext import (
 )
 from groq import Groq, RateLimitError, APIError
 
+# Opsional: deteksi timezone otomatis dari lokasi
+# pip install timezonefinder
+try:
+    from timezonefinder import TimezoneFinder
+    tf = TimezoneFinder()
+    LOCATION_SUPPORT = True
+except ImportError:
+    tf = None
+    LOCATION_SUPPORT = False
+    print("⚠ timezonefinder tidak terinstall. Fitur deteksi lokasi nonaktif.")
+    print("  Install dengan: pip install timezonefinder")
+
 # ============================================================
 # KONFIGURASI
 # ============================================================
@@ -23,15 +36,18 @@ GROQ_API_KEY   = os.environ.get("GROQ_API_KEY")
 MCP_URL        = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID        = os.environ.get("CHAT_ID")
 
-# ⭐ MODEL CONFIG (gampang ganti di sini)
-MODEL_CHAT       = "openai/gpt-oss-120b"        # Model utama untuk jawab user
-MODEL_CLASSIFIER = "llama-3.1-8b-instant"       # Model kecil untuk classify intent
+# ⭐ MODEL CONFIG
+MODEL_CHAT       = "openai/gpt-oss-120b"
+MODEL_CLASSIFIER = "llama-3.1-8b-instant"
 
 # Tuning parameters
 CHECK_INTERVAL   = 600   # auto-cek aktivitas tiap 10 menit
 STREAM_INTERVAL  = 1.5   # interval edit pesan saat streaming
 MAX_HISTORY      = 8     # max pesan history per user
 GARMIN_CACHE_TTL = 300   # cache data Garmin 5 menit
+
+# Timezone default jika user belum set
+DEFAULT_TZ = "Asia/Makassar"  # WITA — ganti sesuai kebutuhan
 # ============================================================
 
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -39,7 +55,99 @@ reported_activities = set()
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 
 # Cache data Garmin per user
-garmin_cache = {}  # {user_id: (timestamp, data)}
+garmin_cache = {}   # {user_id: (timestamp, data)}
+
+# Timezone per user — disimpan in-memory
+# Untuk persistent, bisa ganti dengan sqlite/json file
+user_timezones = {}  # {user_id: "Asia/Makassar"}
+
+# Alias timezone yang mudah diingat
+TIMEZONE_ALIASES = {
+    # Indonesia
+    "wib":      "Asia/Jakarta",
+    "wita":     "Asia/Makassar",
+    "wit":      "Asia/Jayapura",
+    "jakarta":  "Asia/Jakarta",
+    "makassar": "Asia/Makassar",
+    "manado":   "Asia/Makassar",
+    "bali":     "Asia/Makassar",
+    "jayapura": "Asia/Jayapura",
+    "papua":    "Asia/Jayapura",
+    # Asia Tenggara
+    "singapore":  "Asia/Singapore",
+    "malaysia":   "Asia/Kuala_Lumpur",
+    "thailand":   "Asia/Bangkok",
+    "vietnam":    "Asia/Ho_Chi_Minh",
+    "philippines": "Asia/Manila",
+    "japan":      "Asia/Tokyo",
+    "korea":      "Asia/Seoul",
+    # Umum
+    "utc":   "UTC",
+    "gmt":   "UTC",
+    "london": "Europe/London",
+    "paris":  "Europe/Paris",
+    "sydney": "Australia/Sydney",
+    "ny":     "America/New_York",
+    "la":     "America/Los_Angeles",
+}
+
+
+# ── Helper timezone ───────────────────────────────────────────
+def get_user_tz(user_id: int) -> ZoneInfo:
+    """Ambil timezone user, fallback ke DEFAULT_TZ."""
+    tz_name = user_timezones.get(user_id, DEFAULT_TZ)
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def get_tz_name(user_id: int) -> str:
+    return user_timezones.get(user_id, DEFAULT_TZ)
+
+
+def convert_utc_to_local(text: str, user_id: int) -> str:
+    """
+    Konversi semua timestamp UTC dalam teks ke timezone lokal user.
+    Mendukung format:
+      - ISO 8601: 2026-04-26T20:54:00Z  atau  2026-04-26T20:54:00+00:00
+      - Epoch integer (detik): 1745704440
+    """
+    tz = get_user_tz(user_id)
+
+    # Format ISO 8601
+    def replace_iso(m):
+        raw = m.group(0)
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            local_dt = dt.astimezone(tz)
+            return local_dt.strftime("%d %b %Y %H:%M %Z")
+        except Exception:
+            return raw
+
+    text = re.sub(
+        r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})',
+        replace_iso,
+        text
+    )
+
+    # Format epoch (angka >= 10 digit yang masuk akal sebagai timestamp)
+    def replace_epoch(m):
+        raw = m.group(0)
+        try:
+            ts = int(raw)
+            # Validasi: antara 2020 dan 2040
+            if 1577836800 <= ts <= 2208988800:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                local_dt = dt.astimezone(tz)
+                return local_dt.strftime("%d %b %Y %H:%M %Z")
+        except Exception:
+            pass
+        return raw
+
+    text = re.sub(r'\b(1[5-9]\d{8}|2[0-1]\d{8})\b', replace_epoch, text)
+
+    return text
 
 
 # ── Convert markdown ke HTML Telegram ─────────────────────────
@@ -57,7 +165,7 @@ def markdown_to_html(text: str) -> str:
 
 def safe_html_for_streaming(text: str) -> str:
     html = markdown_to_html(text)
-    open_b = html.count("<b>") - html.count("</b>")
+    open_b    = html.count("<b>")    - html.count("</b>")
     open_code = html.count("<code>") - html.count("</code>")
     if open_code > 0:
         html += "</code>" * open_code
@@ -79,13 +187,23 @@ INTENT_CLASSIFIER_PROMPT = """Klasifikasikan pesan user ke salah satu kategori:
 Jawab HANYA satu kata kategori."""
 
 
-COACH_SYSTEM_PROMPT = """Kamu adalah Running Assistant, pelatih lari pribadi yang ramah dan conversational.
+def build_coach_prompt(user_id: int) -> str:
+    tz_name = get_tz_name(user_id)
+    tz = get_user_tz(user_id)
+    now_local = datetime.now(tz)
+    tz_abbr = now_local.strftime("%Z")  # WIB / WITA / WIT / dll
+
+    return f"""Kamu adalah Running Assistant, pelatih lari pribadi yang ramah dan conversational.
 
 KARAKTER:
 - Ramah seperti teman, bukan robot formal
 - Bahasa Indonesia santai tapi profesional
 - Inget konteks percakapan sebelumnya
 - Motivatif dan supportive
+
+TIMEZONE USER: {tz_name} ({tz_abbr})
+- Semua data waktu yang diterima sudah dikonversi ke timezone user ini
+- Tampilkan waktu sesuai timezone tersebut, JANGAN sebut UTC
 
 ATURAN:
 
@@ -113,6 +231,7 @@ ATURAN:
    - HR: tambah "bpm". Contoh: "136 bpm"
    - Kalori: tambah "kcal". Contoh: "8.431 kcal"
    - JANGAN tampilkan satuan raw (meter, detik)
+   - WAKTU: Semua waktu sudah dalam {tz_abbr}, tampilkan apa adanya tanpa konversi tambahan
 
 5. FORMATTING:
    - Bold pakai **double asterisk** untuk angka penting
@@ -179,19 +298,20 @@ async def call_mcp(tool_name: str, arguments: dict = {}) -> str:
         return f"Error: {str(e)}"
 
 
-# ── Ambil data Garmin (DENGAN CACHE) ──────────────────────────
+# ── Ambil data Garmin (dengan cache + konversi timezone) ──────
 async def fetch_garmin_data(user_id: int = 0) -> str:
-    """Fetch data Garmin dengan cache 5 menit per user."""
     now = time.time()
 
-    # Cek cache
-    if user_id in garmin_cache:
-        cached_time, cached_data = garmin_cache[user_id]
+    # Cek cache — cache per (user_id, tz_name) agar beda tz tidak tabrakan
+    tz_name = get_tz_name(user_id)
+    cache_key = (user_id, tz_name)
+
+    if cache_key in garmin_cache:
+        cached_time, cached_data = garmin_cache[cache_key]
         if now - cached_time < GARMIN_CACHE_TTL:
             print(f"✓ Pakai cache Garmin (age: {int(now - cached_time)}s)")
             return cached_data
 
-    # Fetch baru
     today = date.today().isoformat()
     bulan_lalu = (date.today() - timedelta(days=30)).isoformat()
 
@@ -205,10 +325,13 @@ async def fetch_garmin_data(user_id: int = 0) -> str:
         "to_date": today
     })
 
-    data = f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
+    raw = f"=== AKTIVITAS 30 HARI TERAKHIR ===\n{aktivitas}\n\n=== STATISTIK ===\n{stats}"
 
-    garmin_cache[user_id] = (now, data)
-    print(f"✓ Fetch Garmin baru, cached")
+    # Konversi semua timestamp ke timezone user
+    data = convert_utc_to_local(raw, user_id)
+
+    garmin_cache[cache_key] = (now, data)
+    print(f"✓ Fetch Garmin baru, cached (tz: {tz_name})")
 
     return data
 
@@ -222,9 +345,9 @@ async def stream_groq_to_telegram(
     context: ContextTypes.DEFAULT_TYPE,
     max_retries: int = 2
 ) -> str:
-    """Stream response dengan auto-retry kalau rate limit."""
+    system_prompt = build_coach_prompt(user_id)
 
-    messages = [{"role": "system", "content": COACH_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_prompt}]
     history = list(conversation_history[user_id])
     messages.extend(history)
 
@@ -240,20 +363,17 @@ async def stream_groq_to_telegram(
         except RateLimitError as e:
             if attempt < max_retries:
                 wait_time = 30
-                error_msg = str(e)
-                match = re.search(r'try again in ([\d.]+)s', error_msg)
+                match = re.search(r'try again in ([\d.]+)s', str(e))
                 if match:
                     wait_time = float(match.group(1)) + 1
 
                 print(f"⚠ Rate limit, tunggu {wait_time}s...")
-
                 try:
                     await message.edit_text(
                         f"⏳ Server sibuk, tunggu sebentar ({int(wait_time)}s)..."
                     )
                 except:
                     pass
-
                 await asyncio.sleep(wait_time)
                 continue
             else:
@@ -267,18 +387,14 @@ async def stream_groq_to_telegram(
         except APIError as e:
             print(f"Groq API error: {e}")
             try:
-                await message.edit_text(
-                    "❌ Ada error dari server AI. Coba lagi sebentar ya!"
-                )
+                await message.edit_text("❌ Ada error dari server AI. Coba lagi sebentar ya!")
             except:
                 pass
             return ""
         except Exception as e:
             print(f"Stream error: {e}")
             try:
-                await message.edit_text(
-                    f"❌ Terjadi error: {str(e)[:100]}\nCoba lagi ya!"
-                )
+                await message.edit_text(f"❌ Terjadi error: {str(e)[:100]}\nCoba lagi ya!")
             except:
                 pass
             return ""
@@ -287,8 +403,6 @@ async def stream_groq_to_telegram(
 
 
 async def _do_stream(user_id, user_message, messages, message, context):
-    """Helper internal untuk streaming."""
-
     def get_stream():
         return groq_client.chat.completions.create(
             model=MODEL_CHAT,
@@ -325,15 +439,13 @@ async def _do_stream(user_id, user_message, messages, message, context):
         now = asyncio.get_event_loop().time()
         if now - last_update_time >= STREAM_INTERVAL:
             html_text = safe_html_for_streaming(full_text) + " ▌"
-
             if html_text != last_sent_html:
                 try:
                     await message.edit_text(html_text, parse_mode=ParseMode.HTML)
                     last_sent_html = html_text
                     last_update_time = now
                     await context.bot.send_chat_action(
-                        chat_id=message.chat_id,
-                        action=ChatAction.TYPING
+                        chat_id=message.chat_id, action=ChatAction.TYPING
                     )
                 except RetryAfter as e:
                     await asyncio.sleep(e.retry_after)
@@ -358,14 +470,13 @@ async def _do_stream(user_id, user_message, messages, message, context):
         except Exception as e:
             print(f"Final edit error: {e}")
 
-    # Simpan ke history
     conversation_history[user_id].append({"role": "user", "content": user_message})
     conversation_history[user_id].append({"role": "assistant", "content": full_text})
 
     return full_text
 
 
-# ── Cek aktivitas baru (auto-notif) ───────────────────────────
+# ── Auto-notif aktivitas baru ─────────────────────────────────
 async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
     global reported_activities
 
@@ -394,17 +505,20 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
         if signature not in reported_activities:
             reported_activities.add(signature)
 
+            # Konversi ke timezone CHAT_ID user (pakai user_id=0 → default tz)
+            hasil_lokal = convert_utc_to_local(hasil, 0)
+
             try:
                 response = groq_client.chat.completions.create(
                     model=MODEL_CHAT,
                     messages=[
-                        {"role": "system", "content": COACH_SYSTEM_PROMPT},
+                        {"role": "system", "content": build_coach_prompt(0)},
                         {
                             "role": "user",
                             "content": (
-                                f"Data Garmin terbaru:\n{hasil}\n\n"
+                                f"Data Garmin terbaru:\n{hasil_lokal}\n\n"
                                 "Ada aktivitas lari baru baru aja kedeteksi! Kasih ringkasan singkat "
-                                "(jarak km, pace, durasi jam:menit) plus motivasi pendek."
+                                "(jarak km, pace, durasi jam:menit, waktu mulai) plus motivasi pendek."
                             )
                         }
                     ],
@@ -431,15 +545,10 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Error handler global ──────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tangani semua error yang lolos."""
     error = context.error
-
-    # Skip Conflict error (instance ganda) biar log nggak penuh
     if isinstance(error, Conflict):
         return
-
     print(f"⚠ Global error: {error}")
-
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -453,13 +562,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nama = update.effective_user.first_name
     chat_id = update.effective_chat.id
-    conversation_history[update.effective_user.id].clear()
+    user_id = update.effective_user.id
+    conversation_history[user_id].clear()
+
+    tz_name = get_tz_name(user_id)
+    tz = get_user_tz(user_id)
+    now_local = datetime.now(tz)
+    tz_abbr = now_local.strftime("%Z")
 
     welcome = (
         f"👟 Halo <b>{nama}</b>!\n\n"
         f"Aku <b>Running Assistant</b>, pelatih lari pribadi kamu. "
         f"Tanya apa aja seputar aktivitas Garmin kamu! 💪\n\n"
-        f"📌 Chat ID: <code>{chat_id}</code>\n\n"
+        f"📌 Chat ID: <code>{chat_id}</code>\n"
+        f"🕐 Timezone: <b>{tz_name}</b> ({tz_abbr})\n\n"
         f"<b>Contoh pertanyaan:</b>\n"
         f"• Berapa pace rata-rata saya?\n"
         f"• Lari terjauh saya kapan?\n"
@@ -468,6 +584,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Command:</b>\n"
         f"/ringkasan — analisis 30 hari\n"
         f"/cekkoneksi — tes Garmin\n"
+        f"/settimezone — atur timezone\n"
+        f"/mytimezone — lihat timezone aktif\n"
         f"/reset — reset percakapan\n"
         f"/model — info model AI"
     )
@@ -477,13 +595,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id].clear()
-    if user_id in garmin_cache:
-        del garmin_cache[user_id]
+    # Hapus cache agar data di-fetch ulang dengan timezone terkini
+    keys_to_del = [k for k in garmin_cache if k[0] == user_id]
+    for k in keys_to_del:
+        del garmin_cache[k]
     await update.message.reply_text("✅ Percakapan di-reset. Mulai fresh dari sini ya!")
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Info model yang dipakai bot."""
     info = (
         f"🤖 <b>Model AI Info</b>\n\n"
         f"• <b>Chat utama:</b> <code>{MODEL_CHAT}</code>\n"
@@ -493,16 +612,142 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(info, parse_mode=ParseMode.HTML)
 
 
+async def cmd_mytimezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan timezone aktif user beserta waktu sekarang."""
+    user_id = update.effective_user.id
+    tz_name = get_tz_name(user_id)
+    tz = get_user_tz(user_id)
+    now_local = datetime.now(tz)
+
+    await update.message.reply_text(
+        f"🕐 <b>Timezone kamu saat ini:</b>\n"
+        f"<code>{tz_name}</code>\n\n"
+        f"⏰ Waktu lokal sekarang:\n"
+        f"<b>{now_local.strftime('%d %b %Y %H:%M %Z')}</b>\n\n"
+        f"Untuk ganti: /settimezone",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_settimezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Set timezone user.
+    Usage: /settimezone wita
+           /settimezone Asia/Jakarta
+           /settimezone  (tanpa argumen → tampilkan daftar)
+    """
+    user_id = update.effective_user.id
+    args = context.args
+
+    if not args:
+        tz_name = get_tz_name(user_id)
+        tz = get_user_tz(user_id)
+        now_local = datetime.now(tz)
+
+        await update.message.reply_text(
+            f"🕐 <b>Timezone kamu sekarang:</b> <code>{tz_name}</code>\n"
+            f"⏰ Waktu lokal: <b>{now_local.strftime('%d %b %Y %H:%M %Z')}</b>\n\n"
+            f"<b>Cara ganti timezone:</b>\n"
+            f"/settimezone wib\n"
+            f"/settimezone wita\n"
+            f"/settimezone wit\n"
+            f"/settimezone singapore\n"
+            f"/settimezone Asia/Tokyo\n\n"
+            f"<b>Atau kirim 📍 Lokasi</b> untuk deteksi otomatis!\n\n"
+            f"<b>Daftar alias tersedia:</b>\n"
+            + "\n".join(
+                f"• <code>{k}</code> → {v}"
+                for k, v in TIMEZONE_ALIASES.items()
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    tz_input = args[0].strip()
+
+    # Cek alias dulu
+    tz_name = TIMEZONE_ALIASES.get(tz_input.lower(), tz_input)
+
+    # Validasi timezone
+    try:
+        tz = ZoneInfo(tz_name)
+        user_timezones[user_id] = tz_name
+
+        # Hapus cache lama agar data di-fetch ulang
+        keys_to_del = [k for k in garmin_cache if k[0] == user_id]
+        for k in keys_to_del:
+            del garmin_cache[k]
+
+        now_local = datetime.now(tz)
+        await update.message.reply_text(
+            f"✅ <b>Timezone berhasil diubah!</b>\n\n"
+            f"📍 Timezone: <code>{tz_name}</code>\n"
+            f"⏰ Waktu lokal kamu sekarang:\n"
+            f"<b>{now_local.strftime('%d %b %Y %H:%M %Z')}</b>\n\n"
+            f"Data Garmin kamu akan ditampilkan dalam timezone ini mulai sekarang.",
+            parse_mode=ParseMode.HTML
+        )
+    except ZoneInfoNotFoundError:
+        await update.message.reply_text(
+            f"❌ Timezone <code>{tz_input}</code> tidak dikenali.\n\n"
+            f"Coba salah satu alias ini:\n"
+            f"• <code>wib</code>, <code>wita</code>, <code>wit</code>\n"
+            f"• <code>singapore</code>, <code>malaysia</code>\n\n"
+            f"Atau format IANA lengkap:\n"
+            f"• <code>Asia/Jakarta</code>\n"
+            f"• <code>Asia/Singapore</code>\n\n"
+            f"Lihat daftar lengkap: /settimezone",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deteksi timezone otomatis dari lokasi yang dikirim user."""
+    user_id = update.effective_user.id
+    loc = update.message.location
+
+    if not LOCATION_SUPPORT or tf is None:
+        await update.message.reply_text(
+            "⚠️ Fitur deteksi lokasi belum aktif di bot ini.\n"
+            "Gunakan /settimezone untuk set timezone manual."
+        )
+        return
+
+    tz_name = tf.timezone_at(lat=loc.latitude, lng=loc.longitude)
+
+    if tz_name:
+        user_timezones[user_id] = tz_name
+
+        # Hapus cache lama
+        keys_to_del = [k for k in garmin_cache if k[0] == user_id]
+        for k in keys_to_del:
+            del garmin_cache[k]
+
+        tz = ZoneInfo(tz_name)
+        now_local = datetime.now(tz)
+
+        await update.message.reply_text(
+            f"📍 <b>Lokasi terdeteksi!</b>\n\n"
+            f"✅ Timezone: <code>{tz_name}</code>\n"
+            f"⏰ Waktu lokal kamu:\n"
+            f"<b>{now_local.strftime('%d %b %Y %H:%M %Z')}</b>\n\n"
+            f"Data Garmin akan ditampilkan dalam timezone ini.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Gagal mendeteksi timezone dari lokasi ini.\n"
+            "Coba /settimezone untuk set manual."
+        )
+
+
 async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
-
     pesan = await update.message.reply_text("▌")
     data = await fetch_garmin_data(user_id)
-
     await stream_groq_to_telegram(
         user_id,
         "Kasih analisis lengkap aktivitas lari aku 30 hari terakhir dengan format section yang rapi (statistik utama, detail aktivitas, performa tubuh, dan insight).",
@@ -554,7 +799,6 @@ async def handle_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif intent == "follow_up":
         await stream_groq_to_telegram(user_id, pertanyaan, "", pesan, context)
     else:
-        # tanya_spesifik / analisis_lengkap / saran_latihan
         data = await fetch_garmin_data(user_id)
         await stream_groq_to_telegram(user_id, pertanyaan, data, pesan, context)
 
@@ -564,14 +808,19 @@ def main():
     print("🤖 Running Assistant Bot berjalan...")
     print(f"   Chat model:       {MODEL_CHAT}")
     print(f"   Classifier model: {MODEL_CLASSIFIER}")
+    print(f"   Default timezone: {DEFAULT_TZ}")
+    print(f"   Deteksi lokasi:   {'✓ aktif' if LOCATION_SUPPORT else '✗ nonaktif (install timezonefinder)'}")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("ringkasan",   cmd_ringkasan))
-    app.add_handler(CommandHandler("cekkoneksi",  cmd_cekkoneksi))
-    app.add_handler(CommandHandler("reset",       cmd_reset))
-    app.add_handler(CommandHandler("model",       cmd_model))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("ringkasan",    cmd_ringkasan))
+    app.add_handler(CommandHandler("cekkoneksi",   cmd_cekkoneksi))
+    app.add_handler(CommandHandler("reset",        cmd_reset))
+    app.add_handler(CommandHandler("model",        cmd_model))
+    app.add_handler(CommandHandler("settimezone",  cmd_settimezone))
+    app.add_handler(CommandHandler("mytimezone",   cmd_mytimezone))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
 
     app.add_error_handler(error_handler)
