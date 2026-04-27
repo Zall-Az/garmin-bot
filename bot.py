@@ -131,14 +131,17 @@ def safe_html_for_streaming(text: str) -> str:
 
 
 # ── System prompts ────────────────────────────────────────────
-INTENT_CLASSIFIER_PROMPT = """Klasifikasikan pesan user ke salah satu kategori:
+INTENT_CLASSIFIER_PROMPT = """Klasifikasikan pesan user ke salah satu kategori. Baca dengan teliti sebelum memilih.
 
-- "sapaan": Pesan kasual seperti "halo", "hi", "pagi", "terima kasih", "oke" - tanpa pertanyaan data lari
-- "tanya_spesifik": Pertanyaan ASPEK TERTENTU dari data lari (pace, denyut nadi, jarak hari ini, dll)
-- "analisis_lengkap": Permintaan analisis menyeluruh (analisis dong, ringkasan, evaluasi performa)
-- "saran_latihan": Minta saran/rekomendasi latihan
-- "follow_up": Pertanyaan lanjutan singkat ("kenapa?", "terus?", "detailnya")
-- "lain": Di luar konteks lari/Garmin
+KATEGORI:
+- "sapaan": HANYA pesan kasual MURNI tanpa meminta data apapun. Contoh: "halo", "hi", "pagi", "makasih", "oke", "mantap". BUKAN sapaan jika ada kata: data, lari, tanggal, pace, jarak, HR, aktivitas, berikan, kasih, lihat, cek, analisis.
+- "tanya_spesifik": Meminta data/info TERTENTU. Contoh: "data tanggal X", "pace kemarin", "berapa jarak hari ini", "HR tadi", "lari terakhir", "berikan data", "lihat aktivitas".
+- "analisis_lengkap": Minta analisis/ringkasan menyeluruh. Contoh: "analisis dong", "ringkasan bulan ini", "evaluasi performa".
+- "saran_latihan": Minta saran atau rekomendasi latihan.
+- "follow_up": Pertanyaan lanjutan SANGAT SINGKAT tanpa topik baru. Contoh: "kenapa?", "terus?", "detailnya", "maksudnya?".
+- "lain": Topik di luar lari/Garmin sama sekali.
+
+PENTING: Jika pesan mengandung kata seperti "data", "tanggal", "berikan", "lihat", "cek", "aktivitas", "lari" → JANGAN pilih "sapaan".
 
 Jawab HANYA satu kata kategori."""
 
@@ -186,6 +189,8 @@ ATURAN:
    - Inget percakapan sebelumnya
    - Kalau user nanya "kenapa?" atau "terus?", lanjutkan dari topik tadi
    - Jangan ulang info yang udah dikasih sebelumnya
+   - Kalau user minta data tanggal SPESIFIK, cari aktivitas di tanggal itu dari data yang ada.
+     Kalau tidak ada aktivitas di tanggal itu, bilang jujur: "Tidak ada aktivitas lari di tanggal tersebut."
 
 7. ANTI-HALUSINASI — ATURAN PALING PENTING:
    - HANYA gunakan angka dan fakta yang ADA di blok [Data Garmin] yang diberikan
