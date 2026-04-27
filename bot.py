@@ -25,7 +25,7 @@ GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
 MCP_URL             = "https://garmin.amalgama.co/api/v1/mcp/48247257-4554-43df-9e93-e7dd3710c58a"
 CHAT_ID             = os.environ.get("CHAT_ID")
 
-MODEL_CHAT       = "gemini-2.5-flash-preview-05-20"
+MODEL_CHAT       = "gemini-2.5-flash"
 TEMPERATURE_CHAT = 0.1          # sangat rendah → lebih faktual, minim halusinasi
 
 CHECK_INTERVAL   = 600
