@@ -559,7 +559,7 @@ async def fetch_garmin_data(user_id: int = 0):
 
     today      = date.today().isoformat()
     besok      = (date.today() + timedelta(days=1)).isoformat()  # ← tambah ini
-    bulan_lalu = (date.today() - timedelta(days=30)).isoformat()
+    bulan_lalu = (date.today() - timedelta(days=31)).isoformat()
 
     aktivitas_raw = await call_mcp("list_activities", {
         "limit": 20, "from_date": bulan_lalu, "to_date": besok  # ← pakai besok
@@ -614,8 +614,9 @@ async def fetch_garmin_data(user_id: int = 0):
 async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cek aktivitas hari ini secara eksplisit."""
     pesan = await update.message.reply_text("🔍 Mengambil data hari ini...")
-    today = date.today().isoformat()
-    besok = (date.today() + timedelta(days=1)).isoformat()
+
+    today = (date.today() - timedelta(days=1)).isoformat()
+    besok = date.today().isoformat()
     
     raw = await call_mcp("list_activities", {
         "limit": 5, "from_date": today, "to_date": besok
@@ -829,7 +830,7 @@ async def cek_aktivitas_baru(context: ContextTypes.DEFAULT_TYPE):
         return
 
     today   = date.today().isoformat()
-    kemarin = (date.today() - timedelta(days=2)).isoformat()
+    kemarin = (date.today() - timedelta(days=3)).isoformat()
 
     try:
         hasil_raw = await call_mcp("list_activities", {
