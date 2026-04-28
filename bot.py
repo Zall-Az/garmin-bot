@@ -551,25 +551,21 @@ async def call_mcp(tool_name: str, arguments: dict = {}) -> str:
 # ════════════════════════════════════════════════════════════
 
 async def fetch_garmin_data(user_id: int = 0):
-    """
-    Return data string yang sudah dikonversi, atau None kalau gagal.
-    Data di-cache selama GARMIN_CACHE_TTL detik.
-    """
     now = time.time()
     if user_id in garmin_cache:
         cached_time, cached_data = garmin_cache[user_id]
         if now - cached_time < GARMIN_CACHE_TTL:
-            print(f"✓ Cache hit Garmin (age: {int(now - cached_time)}s)")
             return cached_data
 
     today      = date.today().isoformat()
+    besok      = (date.today() + timedelta(days=1)).isoformat()  # ← tambah ini
     bulan_lalu = (date.today() - timedelta(days=30)).isoformat()
 
     aktivitas_raw = await call_mcp("list_activities", {
-        "limit": 20, "from_date": bulan_lalu, "to_date": today
+        "limit": 20, "from_date": bulan_lalu, "to_date": besok  # ← pakai besok
     })
     stats_raw = await call_mcp("get_activity_stats", {
-        "from_date": bulan_lalu, "to_date": today
+        "from_date": bulan_lalu, "to_date": besok  # ← pakai besok
     })
 
     if "Error" in aktivitas_raw or "Error" in stats_raw:
@@ -614,6 +610,26 @@ async def fetch_garmin_data(user_id: int = 0):
     last_garmin_data[user_id] = data
     print("✓ Garmin data fresh, di-cache")
     return data
+
+async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cek aktivitas hari ini secara eksplisit."""
+    pesan = await update.message.reply_text("🔍 Mengambil data hari ini...")
+    today = date.today().isoformat()
+    besok = (date.today() + timedelta(days=1)).isoformat()
+    
+    raw = await call_mcp("list_activities", {
+        "limit": 5, "from_date": today, "to_date": besok
+    })
+    
+    if not raw.strip() or "Error" in raw:
+        await pesan.edit_text(f"❌ Tidak ada data hari ini.\nRaw: {raw[:300]}")
+    else:
+        hasil = preprocess_garmin_json(raw)
+        hasil = convert_utc_to_wita(hasil)
+        await pesan.edit_text(f"✅ Aktivitas hari ini:\n\n{hasil[:3000]}")
+
+# Di main(), tambahkan:
+app.add_handler(CommandHandler("hariini", cmd_hariini))
 
 
 def get_garmin_context(user_id: int) -> str:
