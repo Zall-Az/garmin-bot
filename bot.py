@@ -628,8 +628,7 @@ async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hasil = convert_utc_to_wita(hasil)
         await pesan.edit_text(f"✅ Aktivitas hari ini:\n\n{hasil[:3000]}")
 
-# Di main(), tambahkan:
-app.add_handler(CommandHandler("hariini", cmd_hariini))
+
 
 
 def get_garmin_context(user_id: int) -> str:
@@ -1099,6 +1098,7 @@ def main():
     app.add_handler(CommandHandler("rawdata",     cmd_rawdata))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("model",       cmd_model))
+    app.add_handler(CommandHandler("hariini", cmd_hariini))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pesan))
     app.add_error_handler(error_handler)
 
